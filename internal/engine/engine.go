@@ -45,6 +45,7 @@ import (
 	"unsafe"
 
 	"github.com/mehmannavaz/ScreenAI/internal/pb"
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // ComponentID is Google's component id for "ScreenAI Library"
@@ -112,12 +113,18 @@ type Options struct {
 	// DebugMode enables the library's debug mode (it dumps I/O protos
 	// to the system temp directory).
 	DebugMode bool
+	// Settings carries the deep config overrides. The four component
+	// config files are rewritten as the library requests them (see
+	// internal/settings); OCRLightMode and DebugMode inside Settings
+	// take precedence over the dedicated Options fields.
+	Settings *settings.Settings
 }
 
 // Engine is one loaded Screen AI library. The OCR and MCE pipelines
 // initialize lazily; all C calls are serialized by an internal lock.
 type Engine struct {
 	componentDir string
+	settings     *settings.Settings
 
 	lib   *library
 	files *modelFileCache
@@ -164,7 +171,11 @@ func Locate(explicit string) (string, error) {
 	return "", fmt.Errorf("%w (looked for %s in: %s)", ErrComponentNotFound, lib, candidates)
 }
 
-// New loads the library and registers the model-file callbacks.
+// New loads the library and registers the model-file callbacks. When
+// opts.Settings carries config-file overrides, they are validated
+// against the component's real files up front — a structurally
+// unexpected config fails here with a clear error instead of deep
+// inside InitOCR.
 func New(opts Options) (*Engine, error) {
 	if err := checkSkBitmapSize(); err != nil {
 		return nil, err
@@ -176,9 +187,23 @@ func New(opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	s := opts.Settings
+	if s == nil {
+		s = settings.Default()
+	}
+	if s.NonEmpty() {
+		if err := validateSettings(dir, s); err != nil {
+			return nil, err
+		}
+	}
+	debug := opts.DebugMode
+	if s.DebugMode != nil {
+		debug = *s.DebugMode
+	}
 	e := &Engine{
 		componentDir: dir,
-		files:        newModelFileCache(dir),
+		files:        newModelFileCache(dir, s),
+		settings:     s,
 	}
 	lib, err := loadLibrary(filepath.Join(dir, LibraryName()), e.files.sizeCB, e.files.contentCB)
 	if err != nil {
@@ -186,13 +211,44 @@ func New(opts Options) (*Engine, error) {
 	}
 	e.lib = lib
 	lib.funcs.setFileContentFunctions(lib.sizeCB, lib.contentCB)
-	if opts.DebugMode {
+	if debug {
 		lib.funcs.enableDebugMode()
+	}
+	if s.OCRLightMode != nil && *s.OCRLightMode {
+		lib.funcs.setOCRLightMode(true)
+		e.ocrLight = true
 	}
 	return e, nil
 }
 
-// Close releases the library handle.
+// Settings returns the settings this engine was created with.
+func (e *Engine) Settings() *settings.Settings { return e.settings }
+
+// validateSettings applies every patch to the component's on-disk files
+// once, purely to surface structural errors early with the file name
+// attached. Only files whose settings are actually overridden are read.
+func validateSettings(dir string, s *settings.Settings) error {
+	for _, rel := range settings.PatchedFiles {
+		if !s.PatchesFile(rel) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil {
+			return fmt.Errorf("settings: component file %s unreadable: %v", rel, err)
+		}
+		if _, err := s.Apply(rel, data); err != nil {
+			return fmt.Errorf("settings: %v", err)
+		}
+	}
+	return nil
+}
+
+// Close releases the engine's own resources. The shared library itself
+// is deliberately kept loaded (see the loaders): the closed-source
+// binary cannot be re-initialized in this process — verified: a second
+// InitOCRUsingCallback with different configs aborts the process — and
+// its background threads would crash on unload. Create exactly one
+// engine per process, which is how Chromium itself uses the component.
 func (e *Engine) Close() error {
 	if e.lib != nil && e.lib.close != nil {
 		return e.lib.close()

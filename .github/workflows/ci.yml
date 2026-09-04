@@ -31,3 +31,44 @@ jobs:
 
       - name: Selftest (hermetic checks, no component)
         run: go run ./cmd/screenai selftest
+
+  live:
+    # Full end-to-end against the real Google component: engine smoke,
+    # config patchers against Google's real files, and the live A/B
+    # proof that settings overrides change the model's actual output.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w -X github.com/mehmannavaz/ScreenAI/internal/cli.Version=dev" -o screenai ./cmd/screenai
+
+      - name: Download the Screen AI component (~124 MB)
+        run: ./screenai download --dir component
+
+      - name: Live selftest (engine + settings patchers + settings A/B)
+        run: ./screenai selftest --component component
+
+      - name: Settings e2e (threshold + scripts + filters via CLI)
+        run: |
+          ./screenai demo --component component -o out-default
+          ./screenai demo --component component --set mce.threshold_non_essential=0.99 -o out-strict
+          ./screenai demo --component component --set ocr.scripts=en --langs en -o out-scripted
+          test -f out-default/example_1_news_article.mce.json
+          test -f out-strict/example_1_news_article.mce.json
+          test -f out-scripted/example_1_news_article.mce.json
+
+      - name: Serve e2e (settings at startup, filters per request)
+        run: |
+          ./screenai serve --port 8778 --component component --set mce.threshold_non_essential=0.99 &
+          SERVER_PID=$!
+          sleep 5
+          curl -s http://127.0.0.1:8778/api/settings | grep -q 'mce.threshold_non_essential=0.99'
+          curl -s --data-binary @out-default/examples/example_1_news_article.png \
+            'http://127.0.0.1:8778/api/process?name=news.png&langs=en&min_conf=0.5' | grep -q '"filter"'
+          kill $SERVER_PID

@@ -1,28 +1,38 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"unsafe"
+
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // modelFileCache serves the ~64 model files the library requests through
 // the SetFileContentFunctions callbacks. The library asks by relative path
 // and expects the bytes to come from the component directory.
 //
+// When settings overrides are active, the bytes of the four known
+// config files are rewritten on first read (see internal/settings) —
+// the library then initializes its pipelines from the patched
+// configs, which is how thresholds, script restrictions and graph
+// parameters reach the closed-source binary.
+//
 // The cache has its own lock: the callbacks are invoked from inside
 // library calls (while the engine lock is held by the caller), so sharing
 // the engine lock would deadlock.
 type modelFileCache struct {
-	dir   string
-	mu    sync.Mutex
-	files map[string][]byte
+	dir      string
+	settings *settings.Settings
+	mu       sync.Mutex
+	files    map[string][]byte
 }
 
-func newModelFileCache(dir string) *modelFileCache {
-	return &modelFileCache{dir: dir, files: map[string][]byte{}}
+func newModelFileCache(dir string, s *settings.Settings) *modelFileCache {
+	return &modelFileCache{dir: dir, settings: s, files: map[string][]byte{}}
 }
 
 // path resolves a library-relative name (any slash style, possibly with a
@@ -33,8 +43,14 @@ func (c *modelFileCache) path(rel string) string {
 	return filepath.Join(append([]string{c.dir}, strings.Split(rel, "/")...)...)
 }
 
-// read returns the file contents (empty when unreadable), caching results.
+// read returns the file contents (empty when unreadable), caching the
+// settings-patched bytes. Setting SCREENAI_TRACE_FILES=1 prints every
+// library file request to stderr — handy for debugging what the
+// pipeline actually loads.
 func (c *modelFileCache) read(rel string) []byte {
+	if os.Getenv("SCREENAI_TRACE_FILES") != "" {
+		fmt.Fprintf(os.Stderr, "VFSREQ: %s\n", rel)
+	}
 	path := c.path(rel)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -44,6 +60,17 @@ func (c *modelFileCache) read(rel string) []byte {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		data = nil
+	}
+	if data != nil && c.settings.NonEmpty() {
+		patched, perr := c.settings.Apply(rel, data)
+		if perr != nil {
+			// Fail loudly but keep the engine alive: a broken
+			// override degrades to the stock config instead of
+			// taking the whole pipeline down.
+			fmt.Fprintf(os.Stderr, "screenai: settings override for %s failed: %v (using stock config)\n", rel, perr)
+		} else {
+			data = patched
+		}
 	}
 	c.files[path] = data
 	return data

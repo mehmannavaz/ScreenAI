@@ -4,16 +4,24 @@
 //
 //	GET  /                     tiny human-readable status page
 //	GET  /api/info             engine info (version, max dim, light mode)
+//	GET  /api/settings         every available setting + effective overrides
 //	POST /api/process          the whole pipeline; body = raw file bytes
 //	                          query: name=<filename>   (format hint)
 //	                                 light=0|1         (OCR light model)
 //	                                 maxdim=<px>       (pre-OCR downscale)
 //	                                 mce=0|1           (run Screen2x)
+//	                                 langs=en,ja       (language filter)
+//	                                 min_conf=0.8      (confidence filter)
 //	GET  /api/sample           one bundled example image
 //
 // The engine is single-threaded by nature; the whole /api/process
 // pipeline runs inside engine.Session so settings cannot interleave
 // between concurrent requests.
+//
+// Engine-level settings (thresholds, script registry, graph params)
+// are fixed at startup — the library caches its configs after
+// InitOCR — and are configured with --set / --settings on the serve
+// command. The language / confidence post-filters are per-request.
 package server
 
 import (
@@ -30,6 +38,7 @@ import (
 	"github.com/mehmannavaz/ScreenAI/examples"
 	"github.com/mehmannavaz/ScreenAI/internal/engine"
 	"github.com/mehmannavaz/ScreenAI/internal/pipeline"
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // DefaultPort is the default TCP port.
@@ -59,9 +68,13 @@ func (s *state) snapshot() map[string]any {
 }
 
 // Serve creates the engine, prints the endpoints, and serves the API
-// until Ctrl+C.
-func Serve(bind string, port int, componentDir string) error {
-	eng, err := engine.New(engine.Options{ComponentDir: componentDir})
+// until Ctrl+C. s carries the engine-lifetime settings (--set on the
+// serve command); the per-request post-filters arrive as query params.
+func Serve(bind string, port int, componentDir string, s *settings.Settings) error {
+	if s == nil {
+		s = settings.Default()
+	}
+	eng, err := engine.New(engine.Options{ComponentDir: componentDir, Settings: s})
 	if err != nil {
 		return err
 	}
@@ -70,6 +83,7 @@ func Serve(bind string, port int, componentDir string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { statusPage(w, r, eng, st) })
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) { apiInfo(w, r, eng, st) })
+	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) { apiSettings(w, r, s) })
 	mux.HandleFunc("/api/process", func(w http.ResponseWriter, r *http.Request) { apiProcess(w, r, eng, st) })
 	mux.HandleFunc("/api/sample", apiSample)
 
@@ -79,7 +93,10 @@ func Serve(bind string, port int, componentDir string) error {
 	fmt.Printf("Chrome Screen AI server — libchromescreenai v%s\n", eng.VersionString())
 	fmt.Printf("  component : %s\n", eng.ComponentDir())
 	fmt.Printf("  listening : %s  (bind %s)\n", url, bind)
-	fmt.Printf("  endpoints : GET /api/info · POST /api/process?name=file.png · GET /api/sample\n")
+	fmt.Printf("  endpoints : GET /api/info · GET /api/settings · POST /api/process?name=file.png · GET /api/sample\n")
+	if eff := s.Effective(); len(eff) > 0 {
+		fmt.Printf("  settings  : %s\n", strings.Join(eff, " · "))
+	}
 	fmt.Printf("  Press Ctrl+C to stop.\n")
 
 	srv := &http.Server{
@@ -175,6 +192,12 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 	maxdim := 0
 	fmt.Sscanf(q.Get("maxdim"), "%d", &maxdim)
 	wantMCE := !(q.Get("mce") == "0" || q.Get("mce") == "false")
+	var langs []string
+	if v := q.Get("langs"); v != "" {
+		langs = strings.Split(v, ",")
+	}
+	minConf := 0.0
+	fmt.Sscanf(q.Get("min_conf"), "%g", &minConf)
 
 	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	data, err := readAll(r)
@@ -199,7 +222,11 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 		var res *pipeline.Result
 		err = eng.Session(func(s *engine.Session) error {
 			var perr error
-			res, _, perr = pipeline.Process(s, inp, pipeline.Options{Light: light, MaxDim: maxdim, MCE: wantMCE})
+			res, _, perr = pipeline.Process(s, inp, pipeline.Options{
+				Light: light, MaxDim: maxdim, MCE: wantMCE,
+				Languages: langs, MinConfidence: minConf,
+				Effective: eng.Settings().Effective(),
+			})
 			return perr
 		})
 		if err == nil {
@@ -234,6 +261,30 @@ func (s *state) note(name string, ms int) {
 	s.mu.Lock()
 	s.last = map[string]any{"name": name, "ms": ms}
 	s.mu.Unlock()
+}
+
+func apiSettings(w http.ResponseWriter, r *http.Request, s *settings.Settings) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "GET only"})
+		return
+	}
+	docs := make([]map[string]any, 0, len(settings.Descriptors))
+	for _, d := range settings.Descriptors {
+		docs = append(docs, map[string]any{
+			"key":       d.Key,
+			"type":      d.Type,
+			"default":   d.Default,
+			"mechanism": string(d.Mechanism),
+			"summary":   d.Summary,
+			"effect":    d.Effect,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"settings":  docs,
+		"effective": s.Effective(),
+		"note":      "Engine-level settings are fixed while the server runs (the library caches configs after InitOCR); restart with different --set values to change them. langs and min_conf are per-request query params on /api/process.",
+	})
 }
 
 func apiSample(w http.ResponseWriter, r *http.Request) {

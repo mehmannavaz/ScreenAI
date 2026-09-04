@@ -55,8 +55,13 @@ func loadLibrary(path string, sizeFn func(*byte) uint32, contentFn func(*byte, u
 		}
 	}
 
+	// The library is deliberately never unloaded (dll.Release is not
+	// called after loading): it spawns background threads and its static
+	// destructors corrupt any later use — the same reason it cannot be
+	// re-initialized in-process. Chrome keeps the component loaded for
+	// the process lifetime too. Release() stays only on the bind-error
+	// path above, where no engine was ever handed out.
 	return &library{
-		close:      dll.Release,
 		funcs:      f,
 		sizeCB:     purego.NewCallback(sizeFn),
 		contentCB:  purego.NewCallback(contentFn),

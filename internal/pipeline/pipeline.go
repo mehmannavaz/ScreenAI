@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
+	"strings"
 	"time"
 
 	"github.com/mehmannavaz/ScreenAI/internal/engine"
@@ -29,6 +30,15 @@ type Options struct {
 	MaxDim int
 	// MCE controls whether Screen2x runs on the result.
 	MCE bool
+	// Languages, when non-empty, keeps only OCR lines whose detected
+	// language matches (settings key ocr.languages).
+	Languages []string
+	// MinConfidence drops OCR lines below this confidence
+	// (settings key ocr.min_confidence; 0 = keep everything).
+	MinConfidence float64
+	// Effective is the rendered settings list echoed into results
+	// ("key=value" strings) so every output records how it was made.
+	Effective []string
 }
 
 // ReaderPart is one entry of the MCE reader view: a top-most selected
@@ -80,6 +90,20 @@ type Result struct {
 	MCE          *MCE           `json:"mce,omitempty"`
 	PNGBase64    string         `json:"png_base64,omitempty"`
 	DownscaledTo []int          `json:"downscaled_to,omitempty"`
+	Filter       *FilterStats   `json:"filter,omitempty"`
+	Settings     []string       `json:"settings,omitempty"`
+}
+
+// FilterStats reports what the language/confidence post-filters kept.
+// The filtered annotation replaces the plain one in results, so these
+// numbers preserve the unfiltered view.
+type FilterStats struct {
+	Languages     []string `json:"languages,omitempty"`
+	MinConfidence float64  `json:"min_confidence,omitempty"`
+	LinesBefore   int      `json:"lines_before"`
+	LinesKept     int      `json:"lines_kept"`
+	WordsBefore   int      `json:"words_before"`
+	WordsKept     int      `json:"words_kept"`
 }
 
 // ReportData is the side-channel for the file reporter (not part of the
@@ -259,7 +283,7 @@ func TreeForInput(inp *Input) (*pagetree.PageTree, error) {
 // light-mode switch cannot interleave with other callers.
 func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData, error) {
 	start := time.Now()
-	res := &Result{OK: true, Kind: inp.Kind, Format: inp.Format, Name: inp.Name}
+	res := &Result{OK: true, Kind: inp.Kind, Format: inp.Format, Name: inp.Name, Settings: opts.Effective}
 	rep := &ReportData{}
 
 	if opts.Light != s.OCRLightMode() {
@@ -272,6 +296,10 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 		if err != nil {
 			pipelineErr = err
 		} else {
+			// Post-filters (target language / minimum confidence)
+			// are applied BEFORE the MCE tree is built, so the
+			// reader view honors them.
+			ann, res.Filter = FilterAnnotation(ann, opts.Languages, opts.MinConfidence)
 			res.OCR = ann
 			rep.OCR = ann
 			res.Width, res.Height = ann.Width, ann.Height
@@ -321,6 +349,48 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 		return res, rep, pipelineErr
 	}
 	return res, rep, nil
+}
+
+// FilterAnnotation applies the language and confidence post-filters to
+// a copy of the annotation and returns the copy plus statistics. nil is
+// returned as-is (nothing to filter). Language matching is exact on the
+// model's own per-line language id (ISO 639 codes such as "en"); lines
+// without a detected language are kept only when no language filter is
+// set. The input annotation is never mutated.
+func FilterAnnotation(ann *pb.Annotation, languages []string, minConf float64) (*pb.Annotation, *FilterStats) {
+	if ann == nil || (len(languages) == 0 && minConf <= 0) {
+		return ann, nil
+	}
+	want := map[string]bool{}
+	for _, l := range languages {
+		want[strings.ToLower(strings.TrimSpace(l))] = true
+	}
+	out := &pb.Annotation{
+		Width:        ann.Width,
+		Height:       ann.Height,
+		Source:       ann.Source,
+		Elapsed:      ann.Elapsed,
+		DownscaledTo: ann.DownscaledTo,
+		Lines:        make([]pb.Line, 0, len(ann.Lines)),
+	}
+	for _, ln := range ann.Lines {
+		if len(want) > 0 && !want[strings.ToLower(ln.Language)] {
+			continue
+		}
+		if minConf > 0 && ln.Confidence > 0 && float64(ln.Confidence) < minConf {
+			continue
+		}
+		out.Lines = append(out.Lines, ln)
+	}
+	stats := &FilterStats{
+		Languages:     languages,
+		MinConfidence: minConf,
+		LinesBefore:   len(ann.Lines),
+		LinesKept:     len(out.Lines),
+		WordsBefore:   ann.WordCount(),
+		WordsKept:     out.WordCount(),
+	}
+	return out, stats
 }
 
 // Summarize renders a one-line human summary of a Process result.

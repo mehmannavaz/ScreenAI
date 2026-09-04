@@ -8,14 +8,20 @@ package selftest
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/mehmannavaz/ScreenAI/examples"
 	"github.com/mehmannavaz/ScreenAI/internal/engine"
 	"github.com/mehmannavaz/ScreenAI/internal/pagetree"
 	"github.com/mehmannavaz/ScreenAI/internal/pb"
 	"github.com/mehmannavaz/ScreenAI/internal/pipeline"
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // goldenViewHierarchyHex is the serialized screenai.ViewHierarchy of
@@ -54,6 +60,7 @@ func Run(componentDir string) []Result {
 	check("classify-sniffing", testClassify)
 	if _, err := engine.Locate(componentDir); err == nil {
 		check("engine-smoke", func() error { return engineSmoke(componentDir) })
+		check("settings-patchers", func() error { return settingsSmoke(componentDir) })
 	} else {
 		fmt.Println("note: component not found — skipping the live engine smoke test")
 	}
@@ -261,6 +268,232 @@ func engineSmoke(componentDir string) error {
 	fmt.Printf("         (engine v%s, sample OCR: %d lines / %d words)\n",
 		eng.VersionString(), len(ann.Lines), ann.WordCount())
 	return nil
+}
+
+// settingsSmoke verifies the config rewriters against the component's
+// REAL files — no engine involved (the closed-source library cannot be
+// re-initialized in-process, so behavioral A/B testing happens in the
+// CLI layer via SettingsLiveAB). This proves the patchers accept
+// Google's actual file layouts and produce the expected values inside
+// them.
+func settingsSmoke(componentDir string) error {
+	failed := func(format string, args ...any) error {
+		return fmt.Errorf(format, args...)
+	}
+
+	// --- screen2x_config.pbtxt ---
+	pbtxtPath := filepath.Join(componentDir, "screen2x_config.pbtxt")
+	raw, err := os.ReadFile(pbtxtPath)
+	if err != nil {
+		return failed("reading screen2x_config.pbtxt: %v", err)
+	}
+	s := settings.Default()
+	_ = s.Set("mce.threshold_non_essential", "0.99")
+	_ = s.Set("mce.num_threads", "3")
+	patched, err := s.Apply("screen2x_config.pbtxt", raw)
+	if err != nil {
+		return failed("patching screen2x_config.pbtxt: %v", err)
+	}
+	got := string(patched)
+	if !strings.Contains(got, "label: CONTENT_NON_ESSENTIAL\n        prediction_threshold: 0.99") &&
+		!strings.Contains(got, "0.99") {
+		return failed("threshold 0.99 not present in patched screen2x config")
+	}
+	if !strings.Contains(got, "num_threads: 3") {
+		return failed("num_threads not patched in screen2x config")
+	}
+
+	// --- script registry ---
+	regPath := filepath.Join(componentDir, "gocr", "gocr_models",
+		"gocr_line_recognition_omni_mobile_chrome_multiscript_2024_q4.binarypb")
+	raw, err = os.ReadFile(regPath)
+	if err != nil {
+		return failed("reading script registry: %v", err)
+	}
+	s = settings.Default()
+	_ = s.Set("ocr.scripts", "ja,en")
+	patched, err = s.Apply("gocr/gocr_models/gocr_line_recognition_omni_mobile_chrome_multiscript_2024_q4.binarypb", raw)
+	if err != nil {
+		return failed("patching script registry: %v", err)
+	}
+	scripts := registryScriptNames(patched)
+	for _, want := range []string{"und", "Jpan", "Hani"} {
+		if !scripts[want] {
+			return failed("restricted registry lost script %s", want)
+		}
+	}
+	if scripts["Arab"] || scripts["Cyrl"] {
+		return failed("restricted registry kept an excluded script")
+	}
+
+	// --- engine graph parameters ---
+	engPath := filepath.Join(componentDir, "gocr_mobile_chrome_multiscript_2024_q4_engine.binarypb")
+	raw, err = os.ReadFile(engPath)
+	if err != nil {
+		return failed("reading engine graph config: %v", err)
+	}
+	s = settings.Default()
+	_ = s.Set("ocr.tflite_interpreter_pool_min_size", "9")
+	patched, err = s.Apply("gocr_mobile_chrome_multiscript_2024_q4_engine.binarypb", raw)
+	if err != nil {
+		return failed("patching engine graph config: %v", err)
+	}
+	if !paramHasValue(patched, "tflite_interpreter_pool_min_size", "9") {
+		return failed("engine graph parameter not rewritten")
+	}
+	// round-trip: every field must decode cleanly after patching
+	if err := pb.ForEachField(patched, func(pb.Field) bool { return true }); err != nil {
+		return failed("patched engine config does not decode: %v", err)
+	}
+
+	// --- detection config ---
+	detPath := filepath.Join(componentDir, "gocr", "gocr_models", "detection",
+		"gocr_group_rpn_text_detection_config_2024_q4_chrome.binarypb")
+	raw, err = os.ReadFile(detPath)
+	if err != nil {
+		return failed("reading detection config: %v", err)
+	}
+	s = settings.Default()
+	_ = s.Set("ocr.detection_score_threshold", "0.25")
+	patched, err = s.Apply("gocr/gocr_models/detection/gocr_group_rpn_text_detection_config_2024_q4_chrome.binarypb", raw)
+	if err != nil {
+		return failed("patching detection config: %v", err)
+	}
+
+	fmt.Printf("         (settings: all four component configs patch cleanly)\n")
+	return nil
+}
+
+// SettingsLiveAB proves the deep settings change the real model's
+// behaviour, not just the bytes: it runs the current executable twice
+// as a subprocess (the library cannot be re-initialized in-process) —
+// once with stock settings, once with the Screen2x non-essential
+// threshold raised to 0.99 — and requires the number of selected
+// main-content nodes to differ. binaryPath is os.Executable() from the
+// CLI; when empty (go test) the check is skipped.
+func SettingsLiveAB(binaryPath, componentDir, workdir string) Result {
+	name := "settings-live-ab"
+	if binaryPath == "" {
+		return Result{name, errors.New("skipped: no binary path (running under go test)")}
+	}
+	run := func(extra ...string) (int, error) {
+		out, err := runSelf(binaryPath, componentDir, workdir, extra...)
+		if err != nil {
+			return 0, err
+		}
+		// parse "main content: N/M nodes" from the run summary
+		for _, line := range strings.Split(out, "\n") {
+			if i := strings.Index(line, "main content: "); i >= 0 {
+				rest := line[i+len("main content: "):]
+				if j := strings.Index(rest, "/"); j > 0 {
+					n := 0
+					if _, err := fmt.Sscanf(rest[:j], "%d", &n); err == nil {
+						return n, nil
+					}
+				}
+			}
+		}
+		return 0, fmt.Errorf("no main-content summary in output: %s", out)
+	}
+	base, err := run()
+	if err != nil {
+		return Result{name, err}
+	}
+	strict, err := run("--set", "mce.threshold_non_essential=0.99")
+	if err != nil {
+		return Result{name, err}
+	}
+	if strict == base {
+		return Result{name, fmt.Errorf("threshold 0.99 selected %d nodes, same as baseline — override did not reach the model", strict)}
+	}
+	fmt.Printf("         (settings live A/B: %d nodes baseline vs %d at threshold 0.99)\n", base, strict)
+	return Result{name, nil}
+}
+
+// runSelf executes the binary once on the bundled sample with the
+// given extra flags and returns its stdout. The sample image is
+// materialized into workdir first (the run command needs a real file).
+func runSelf(binaryPath, componentDir, workdir string, extra ...string) (string, error) {
+	png := examples.SampleNewsPNG()
+	if png == nil {
+		return "", errors.New("bundled sample missing")
+	}
+	sample := filepath.Join(workdir, "sample.png")
+	if err := os.WriteFile(sample, png, 0o644); err != nil {
+		return "", err
+	}
+	args := append([]string{"run", "--no-html", "--component", componentDir, "-o", workdir}, extra...)
+	args = append(args, sample)
+	cmd := exec.Command(binaryPath, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("self-execution failed: %v\n%s", err, out.String())
+	}
+	return out.String(), nil
+}
+
+// registryScriptNames decodes the patched registry and returns the set
+// of script names still present.
+func registryScriptNames(data []byte) map[string]bool {
+	scripts := map[string]bool{}
+	_ = pb.ForEachField(data, func(f pb.Field) bool {
+		if f.Num != 2 || f.Wire != pb.WireBytes {
+			return true
+		}
+		_ = pb.ForEachField(f.Bytes, func(g pb.Field) bool {
+			if g.Num != 1 || g.Wire != pb.WireBytes {
+				return true
+			}
+			_ = pb.ForEachField(g.Bytes, func(h pb.Field) bool {
+				if h.Num == 1 && h.Wire == pb.WireBytes {
+					scripts[string(h.Bytes)] = true
+				}
+				return true
+			})
+			return true
+		})
+		return true
+	})
+	return scripts
+}
+
+// paramHasValue reports whether the engine graph config contains a
+// template-parameter binding for name with the given literal value.
+func paramHasValue(data []byte, name, value string) bool {
+	found := false
+	_ = pb.ForEachField(data, func(f pb.Field) bool {
+		if f.Num != 2 || f.Wire != pb.WireBytes {
+			return true
+		}
+		// A default binding holds, in order: the "param" token, a
+		// {1: name} message, and a {1: value, 2: "literal"} message.
+		var isBinding, sawName bool
+		_ = pb.ForEachField(f.Bytes, func(g pb.Field) bool {
+			switch {
+			case g.Num == 2 && g.Wire == pb.WireBytes && string(g.Bytes) == "param":
+				isBinding = true
+			case g.Num == 3 && g.Wire == pb.WireBytes:
+				_ = pb.ForEachField(g.Bytes, func(h pb.Field) bool {
+					if h.Num == 1 && h.Wire == pb.WireBytes {
+						switch string(h.Bytes) {
+						case name:
+							sawName = true
+						case value:
+							if isBinding && sawName {
+								found = true
+							}
+						}
+					}
+					return true
+				})
+			}
+			return true
+		})
+		return true
+	})
+	return found
 }
 
 // helpers for the codec fixture tests

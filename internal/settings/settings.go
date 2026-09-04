@@ -1,0 +1,529 @@
+// Package settings exposes every tunable knob of Google's Screen AI
+// component that a wrapper can reach, and rewrites the component's own
+// configuration files on the fly so the closed-source binary itself
+// picks the values up.
+//
+// # Where the knobs live
+//
+// Deep analysis of the component (v153.1) shows distinct layers of
+// configuration, each reached through a different mechanism:
+//
+//  1. The public C API: SetOCRLightMode, EnableDebugMode — direct calls.
+//  2. screen2x_config.pbtxt: the Screen2x main-content model config,
+//     including the class thresholds that decide how aggressively
+//     clutter is filtered.
+//  3. The OCR engine graph (gocr_..._engine.binarypb): a MediaPipe
+//     graph with template parameters (interpreter pool size,
+//     max-in-flight, ...). We rewrite the parameter defaults.
+//  4. The script registry (gocr_line_recognition_..._q4.binarypb): the
+//     script → recognizer-model map (Arab, Cyrl, Jpan, ...). Restricting
+//     it is the "target language" control: only the kept scripts' models
+//     load and run.
+//  5. The text detection config (gocr_group_rpn_text_detection_config_
+//     ..._chrome.binarypb): a protobuf with detection floats, patched by
+//     field number.
+//
+// Layers 2-5 are all served to the library through the
+// SetFileContentFunctions virtual file system, so the wrapper can
+// intercept and rewrite them before the library ever sees them —
+// verified live against the real binary:
+//
+//	mce.threshold_non_essential 0.65→0.01 : 8→7 selected nodes
+//	mce.threshold_non_essential 0.65→0.99 : 8→15 selected nodes
+//	ocr.detection_score_threshold 0.5→0.9 : 25→28 OCR lines
+//	ocr.scripts=all → {und,Grek,Jpan,Kore,Hani} : OCR unchanged, fewer models
+//
+// # What does not exist
+//
+// There is no top-k, temperature, or "set output language" function in
+// the library's public surface: the models are deterministic. Target
+// languages are expressed through ocr.scripts (pipeline restriction)
+// and ocr.languages (result filtering by the model's own per-line
+// language detection). Graph template booleans (use_line_selection,
+// use_aksara_layout, ...) exist in the engine config but flipping them
+// makes InitOCR fail — Google does not ship the alternative sub-models
+// they gate, so they are deliberately not exposed here.
+package settings
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// Mechanism describes how a setting reaches the closed-source library.
+type Mechanism string
+
+const (
+	// MechanismCAPI is a direct call into the library's exported C API.
+	MechanismCAPI Mechanism = "c-api"
+	// MechanismPbtxt rewrites screen2x_config.pbtxt (served via the VFS).
+	MechanismPbtxt Mechanism = "pbtxt"
+	// MechanismGraphParam rewrites a template parameter default inside
+	// the OCR engine graph binarypb.
+	MechanismGraphParam Mechanism = "graph-param"
+	// MechanismRegistry rewrites the script → recognizer registry.
+	MechanismRegistry Mechanism = "script-registry"
+	// MechanismDetection rewrites a float in the detection config.
+	MechanismDetection Mechanism = "detection-config"
+	// MechanismWrapper is applied wrapper-side (pre/post-processing).
+	MechanismWrapper Mechanism = "wrapper"
+)
+
+// Descriptor documents one settings key.
+type Descriptor struct {
+	Key         string
+	Type        string // "bool", "int", "float", "list"
+	Default     string // stock value inside the component as shipped
+	Mechanism   Mechanism
+	Summary     string
+	Effect      string // observed behaviour when changed (live-verified)
+	engineParam string // internal: template parameter name, when applicable
+}
+
+// Settings is the full, user-facing configuration. Nil pointers and
+// empty slices mean "leave the component's stock value untouched".
+//
+// Values are engine-lifetime constants: the library reads its config
+// files during InitOCR and caches them, so changes require a fresh
+// engine. The wrapper-side fields (Languages, MinConfidence) are
+// per-run.
+type Settings struct {
+	// ---- layer 1: public C API ----
+	OCRLightMode *bool // SetOCRLightMode: swap full ↔ light OCR model
+	DebugMode    *bool // EnableDebugMode: dump i/o protos to the temp dir
+
+	// ---- layer 3: OCR engine graph parameters ----
+	TFLitePoolSize *int // tflite_interpreter_pool_min_size (stock 4)
+	MaxInFlight    *int // max_in_flight (stock 1)
+
+	// ---- layer 4: script registry restriction ----
+	// Scripts keeps only these script recognizers. Accepts ISO 15924
+	// script codes (Arab, Cyrl, Hani, ...) or language codes (en, ru,
+	// ja, ...) which are mapped to scripts. 'und' (the Latin/universal
+	// fallback) is always kept — removing it breaks every script.
+	Scripts []string
+
+	// ---- layer 5: text detection config ----
+	DetectionScoreThreshold *float64
+
+	// ---- layer 2: screen2x (MCE) config ----
+	MCEThresholdNonEssential *float64 // stock 0.65 — the effective clutter gate
+	MCEThresholdHeadline     *float64 // stock 0.0
+	MCEThresholdMain         *float64 // stock 0.0
+	MCENumThreads            *int     // stock 1
+	MCEChromePostProcess     *bool    // stock true
+
+	// ---- wrapper-side pre-processing ----
+	MaxImageDim int  // extra pre-OCR downscale cap, 0 = off
+	MCEEnabled  bool // run Screen2x at all
+	MCEExplicit bool // whether MCEEnabled was user-set
+
+	// ---- wrapper-side post-filters (per-run) ----
+	// Languages keeps only OCR lines whose detected language matches
+	// (e.g. "en,de"). Applied before MCE so the reader view honors it.
+	Languages []string
+	// MinConfidence drops OCR lines below this confidence [0,1].
+	MinConfidence float64
+}
+
+// Default returns the stock Settings describing the component exactly
+// as Google ships it (nothing overridden).
+func Default() *Settings { return &Settings{MCEEnabled: true} }
+
+// NonEmpty reports whether any engine-level override is active
+// (anything that changes the bytes served to the library).
+func (s *Settings) NonEmpty() bool {
+	if s == nil {
+		return false
+	}
+	return s.TFLitePoolSize != nil ||
+		s.MaxInFlight != nil ||
+		len(s.Scripts) > 0 ||
+		s.DetectionScoreThreshold != nil ||
+		s.MCEThresholdNonEssential != nil ||
+		s.MCEThresholdHeadline != nil ||
+		s.MCEThresholdMain != nil ||
+		s.MCENumThreads != nil ||
+		s.MCEChromePostProcess != nil
+}
+
+// Descriptors is the complete settings reference, in stable order.
+var Descriptors = []Descriptor{
+	// OCR
+	{
+		Key: "ocr.light_mode", Type: "bool", Default: "false",
+		Mechanism: MechanismCAPI,
+		Summary:   "Use the light (faster, less accurate) OCR model",
+		Effect:    "Trades accuracy for speed; switches via SetOCRLightMode and reloads the pipeline",
+	},
+	{
+		Key: "ocr.debug_mode", Type: "bool", Default: "false",
+		Mechanism: MechanismCAPI,
+		Summary:   "Library debug mode: dumps all i/o protos to the temp dir",
+		Effect:    "Produces debug artifacts; no effect on results",
+	},
+	{
+		Key: "ocr.scripts", Type: "list", Default: "all 21",
+		Mechanism: MechanismRegistry,
+		Summary:   "Restrict loaded scripts/recognizers — the target-language control",
+		Effect:    "Verified: {und,Grek,Jpan,Kore,Hani} keeps English OCR identical while skipping 16 models",
+	},
+	{
+		Key: "ocr.languages", Type: "list", Default: "(all)",
+		Mechanism: MechanismWrapper,
+		Summary:   "Keep only OCR lines detected as these languages (en, ja, ...)",
+		Effect:    "Post-filter using the model's own per-line language id; applied before MCE",
+	},
+	{
+		Key: "ocr.min_confidence", Type: "float", Default: "0",
+		Mechanism: MechanismWrapper,
+		Summary:   "Drop OCR lines below this confidence [0, 1]",
+		Effect:    "Post-filter; 0.8 keeps only high-confidence lines",
+	},
+	{
+		Key: "ocr.max_image_dimension", Type: "int", Default: "0 (library caps at 2048)",
+		Mechanism: MechanismWrapper,
+		Summary:   "Extra pre-OCR downscale cap in pixels",
+		Effect:    "maxdim=800 downscales a 1600px image to 800px before OCR (faster, less detail)",
+	},
+	{
+		Key: "ocr.tflite_interpreter_pool_min_size", Type: "int", Default: "4",
+		Mechanism:   MechanismGraphParam,
+		Summary:     "Minimum TFLite interpreter pool size (OCR graph parameter)",
+		Effect:      "Verified: accepted by the graph; performance knob for parallel inference",
+		engineParam: "tflite_interpreter_pool_min_size",
+	},
+	{
+		Key: "ocr.max_in_flight", Type: "int", Default: "1",
+		Mechanism:   MechanismGraphParam,
+		Summary:     "Maximum requests in flight through the OCR graph",
+		Effect:      "Verified: accepted; raise together with the pool size for throughput",
+		engineParam: "max_in_flight",
+	},
+	{
+		Key: "ocr.detection_score_threshold", Type: "float", Default: "0.5",
+		Mechanism: MechanismDetection,
+		Summary:   "Text-region detection sensitivity (post-processing float)",
+		Effect:    "Verified: 0.5→0.9 changed 25→28 OCR lines on the news example; tune per input",
+	},
+	// MCE
+	{
+		Key: "mce.enabled", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Run Screen2x main-content extraction at all",
+		Effect:    "false = images run OCR only",
+	},
+	{
+		Key: "mce.threshold_non_essential", Type: "float", Default: "0.65",
+		Mechanism: MechanismPbtxt,
+		Summary:   "Screen2x clutter gate: P(non-essential) above this = dropped",
+		Effect:    "Verified: 0.01 → 7 of 41 nodes kept, 0.65 → 8, 0.99 → 15; the aggressive/lenient dial",
+	},
+	{
+		Key: "mce.threshold_headline", Type: "float", Default: "0.0",
+		Mechanism: MechanismPbtxt,
+		Summary:   "Screen2x headline class threshold",
+		Effect:    "Verified accepted; on tested inputs selection is driven by the non-essential gate",
+	},
+	{
+		Key: "mce.threshold_main", Type: "float", Default: "0.0",
+		Mechanism: MechanismPbtxt,
+		Summary:   "Screen2x main-content class threshold",
+		Effect:    "Verified accepted; combine with the non-essential gate for fine control",
+	},
+	{
+		Key: "mce.num_threads", Type: "int", Default: "1",
+		Mechanism: MechanismPbtxt,
+		Summary:   "Screen2x TFLite inference threads",
+		Effect:    "Verified accepted; performance only (the model is deterministic)",
+	},
+	{
+		Key: "mce.chrome_post_process", Type: "bool", Default: "true",
+		Mechanism: MechanismPbtxt,
+		Summary:   "Chrome-specific Screen2x post-processing",
+		Effect:    "Verified accepted; effect depends on the tree shape",
+	},
+}
+
+// Lookup returns the descriptor for key (exact match).
+func Lookup(key string) (Descriptor, bool) {
+	for _, d := range Descriptors {
+		if d.Key == key {
+			return d, true
+		}
+	}
+	return Descriptor{}, false
+}
+
+// Suggestions returns the closest known keys to a misspelled one.
+func Suggestions(key string) []string {
+	var out []string
+	for _, d := range Descriptors {
+		if strings.Contains(d.Key, key) || strings.Contains(key, d.Key) ||
+			levenshtein(d.Key, key) <= 4 {
+			out = append(out, d.Key)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Set applies one "key=value" string from --set / the JSON config /
+// query parameters. Booleans take true/false/1/0; lists are
+// comma-separated.
+func (s *Settings) Set(key, value string) error {
+	if _, ok := Lookup(key); !ok {
+		if sugg := Suggestions(key); len(sugg) > 0 {
+			return fmt.Errorf("unknown setting %q (did you mean: %s?)", key, strings.Join(sugg, ", "))
+		}
+		return fmt.Errorf("unknown setting %q — see `screenai settings`", key)
+	}
+	switch key {
+	case "ocr.light_mode":
+		return setBool(&s.OCRLightMode, key, value)
+	case "ocr.debug_mode":
+		return setBool(&s.DebugMode, key, value)
+	case "ocr.scripts":
+		scripts, err := ParseScripts(strings.Split(value, ","))
+		if err != nil {
+			return fmt.Errorf("%s: %v", key, err)
+		}
+		s.Scripts = scripts
+		return nil
+	case "ocr.languages":
+		langs, err := ParseLanguages(strings.Split(value, ","))
+		if err != nil {
+			return fmt.Errorf("%s: %v", key, err)
+		}
+		s.Languages = langs
+		return nil
+	case "ocr.min_confidence":
+		f, err := parseFloat(key, value, 0, 1)
+		if err != nil {
+			return err
+		}
+		s.MinConfidence = *f
+		return nil
+	case "ocr.max_image_dimension":
+		n, err := parseInt(key, value, 0, 1<<30)
+		if err != nil {
+			return err
+		}
+		s.MaxImageDim = int(n)
+		return nil
+	case "ocr.tflite_interpreter_pool_min_size":
+		n, err := parseInt(key, value, 1, 256)
+		if err != nil {
+			return err
+		}
+		s.TFLitePoolSize = ptr(int(n))
+		return nil
+	case "ocr.max_in_flight":
+		n, err := parseInt(key, value, 1, 256)
+		if err != nil {
+			return err
+		}
+		s.MaxInFlight = ptr(int(n))
+		return nil
+	case "ocr.detection_score_threshold":
+		f, err := parseFloat(key, value, 0, 1)
+		if err != nil {
+			return err
+		}
+		s.DetectionScoreThreshold = f
+		return nil
+	case "mce.enabled":
+		b, err := parseBool(value)
+		if err != nil {
+			return fmt.Errorf("%s: %v", key, err)
+		}
+		s.MCEEnabled, s.MCEExplicit = b, true
+		return nil
+	case "mce.threshold_non_essential":
+		f, err := parseFloat(key, value, 0, 1)
+		if err != nil {
+			return err
+		}
+		s.MCEThresholdNonEssential = f
+		return nil
+	case "mce.threshold_headline":
+		f, err := parseFloat(key, value, 0, 1)
+		if err != nil {
+			return err
+		}
+		s.MCEThresholdHeadline = f
+		return nil
+	case "mce.threshold_main":
+		f, err := parseFloat(key, value, 0, 1)
+		if err != nil {
+			return err
+		}
+		s.MCEThresholdMain = f
+		return nil
+	case "mce.num_threads":
+		n, err := parseInt(key, value, 1, 512)
+		if err != nil {
+			return err
+		}
+		s.MCENumThreads = ptr(int(n))
+		return nil
+	case "mce.chrome_post_process":
+		return setBool(&s.MCEChromePostProcess, key, value)
+	}
+	return fmt.Errorf("setting %q is known but not implemented — this is a bug", key)
+}
+
+// ParseSetList applies every "key=value" entry in order.
+func (s *Settings) ParseSetList(pairs []string) error {
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok {
+			return fmt.Errorf("--set expects key=value, got %q", p)
+		}
+		if err := s.Set(strings.TrimSpace(k), strings.TrimSpace(v)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Effective renders the currently-active (non-default) settings as
+// "key=value" strings — used by `info`, result metadata and the server.
+func (s *Settings) Effective() []string {
+	if s == nil {
+		return nil
+	}
+	var out []string
+	add := func(format string, args ...any) {
+		out = append(out, fmt.Sprintf(format, args...))
+	}
+	if s.OCRLightMode != nil {
+		add("ocr.light_mode=%v", *s.OCRLightMode)
+	}
+	if s.DebugMode != nil {
+		add("ocr.debug_mode=%v", *s.DebugMode)
+	}
+	if len(s.Scripts) > 0 {
+		add("ocr.scripts=%s", strings.Join(s.Scripts, ","))
+	}
+	if len(s.Languages) > 0 {
+		add("ocr.languages=%s", strings.Join(s.Languages, ","))
+	}
+	if s.MinConfidence > 0 {
+		add("ocr.min_confidence=%g", s.MinConfidence)
+	}
+	if s.MaxImageDim > 0 {
+		add("ocr.max_image_dimension=%d", s.MaxImageDim)
+	}
+	if s.TFLitePoolSize != nil {
+		add("ocr.tflite_interpreter_pool_min_size=%d", *s.TFLitePoolSize)
+	}
+	if s.MaxInFlight != nil {
+		add("ocr.max_in_flight=%d", *s.MaxInFlight)
+	}
+	if s.DetectionScoreThreshold != nil {
+		add("ocr.detection_score_threshold=%g", *s.DetectionScoreThreshold)
+	}
+	if s.MCEExplicit {
+		add("mce.enabled=%v", s.MCEEnabled)
+	}
+	if s.MCEThresholdNonEssential != nil {
+		add("mce.threshold_non_essential=%g", *s.MCEThresholdNonEssential)
+	}
+	if s.MCEThresholdHeadline != nil {
+		add("mce.threshold_headline=%g", *s.MCEThresholdHeadline)
+	}
+	if s.MCEThresholdMain != nil {
+		add("mce.threshold_main=%g", *s.MCEThresholdMain)
+	}
+	if s.MCENumThreads != nil {
+		add("mce.num_threads=%d", *s.MCENumThreads)
+	}
+	if s.MCEChromePostProcess != nil {
+		add("mce.chrome_post_process=%v", *s.MCEChromePostProcess)
+	}
+	return out
+}
+
+// --- value parsing helpers ---
+
+func setBool(dst **bool, key, value string) error {
+	b, err := parseBool(value)
+	if err != nil {
+		return fmt.Errorf("%s: %v", key, err)
+	}
+	*dst = ptr(b)
+	return nil
+}
+
+func parseBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("want true/false, got %q", v)
+}
+
+func parseInt(key, v string, min, max int64) (int64, error) {
+	var n int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &n); err != nil {
+		return 0, fmt.Errorf("%s: want an integer, got %q", key, v)
+	}
+	if n < min || n > max {
+		return 0, fmt.Errorf("%s: %d out of range [%d, %d]", key, n, min, max)
+	}
+	return n, nil
+}
+
+func parseFloat(key, v string, min, max float64) (*float64, error) {
+	var f float64
+	if _, err := fmt.Sscanf(strings.TrimSpace(v), "%g", &f); err != nil {
+		return nil, fmt.Errorf("%s: want a number, got %q", key, v)
+	}
+	if f < min || f > max {
+		return nil, fmt.Errorf("%s: %g out of range [%g, %g]", key, f, min, max)
+	}
+	return &f, nil
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func levenshtein(a, b string) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for j := 0; j <= len(b); j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
+}
+
+func min3(a, b, c int) int {
+	m := a
+	if b < m {
+		m = b
+	}
+	if c < m {
+		m = c
+	}
+	return m
+}

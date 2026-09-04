@@ -5,6 +5,7 @@
 //	screenai run FILE...     process inputs (default when bare files are given)
 //	screenai demo            run the bundled examples
 //	screenai info            show library + component info
+//	screenai settings        print the full settings reference
 //	screenai serve           serve the engine as an HTTP API
 //	screenai download        fetch the Screen AI component from Google
 //	screenai selftest        verify codecs (and the engine when present)
@@ -24,6 +25,7 @@ import (
 	"github.com/mehmannavaz/ScreenAI/internal/report"
 	"github.com/mehmannavaz/ScreenAI/internal/selftest"
 	"github.com/mehmannavaz/ScreenAI/internal/server"
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // Version is stamped at build time by -ldflags "-X ...cli.Version=...".
@@ -40,6 +42,7 @@ commands:
   run FILE...     process input files or http(s):// URLs (default command)
   demo            run the bundled examples
   info            show library + component info
+  settings        print every available setting with defaults + effects
   serve           serve the engine as an HTTP API (default port 8778)
   download        fetch the Screen AI component from Google (~124 MB)
   selftest        verify codecs (and the engine when present)
@@ -47,10 +50,14 @@ commands:
 
 flags (run/demo):
   -o DIR          output directory (default ./results)
-  --light         use the light OCR model
-  --no-mce        skip main-content extraction (images: OCR only)
+  --light         use the light OCR model (= --set ocr.light_mode=true)
+  --no-mce        skip main-content extraction (= --set mce.enabled=false)
   --no-html       write JSON only, no HTML reports
   --maxdim PX     extra pre-OCR downscale cap (0 = off)
+  --langs A,B     keep only OCR lines in these languages (en, ja, ...)
+  --min-conf F    drop OCR lines below confidence F (0..1)
+  --set K=V       override any setting (repeatable; see ` + "`screenai settings`" + `)
+  --settings FILE JSON file of settings overrides
   --debug         library debug mode (dumps i/o protos to tmp)
 
 common flags:
@@ -61,14 +68,17 @@ examples:
   screenai download
   screenai info
   screenai run photo.png page.html notes.txt
+  screenai run --langs en --min-conf 0.8 scan.png
+  screenai run --set mce.threshold_non_essential=0.9 photo.png
+  screenai run --set ocr.scripts=und,Jpan,Kore,Hani japan.jpg
   screenai demo
-  screenai serve --port 8778
+  screenai serve --port 8778 --set mce.threshold_non_essential=0.85
 
 The engine is Google's genuine ScreenAI component (id
 mfhmdacoffpmifoibamicehhklffanao) driven through its public C API.
-OCR language is detected by the model per line; the models are
-deterministic, so there are no top-k / temperature knobs anywhere in
-the library's public surface.`
+Every knob the component exposes was extracted by deep analysis; run
+` + "`screenai settings`" + ` for the full reference. There is no top-k or
+temperature anywhere — the models are deterministic.`
 
 // Main runs the CLI and returns the process exit code.
 func Main(argv []string) int {
@@ -87,6 +97,9 @@ func Main(argv []string) int {
 		return 0
 	case "help", "-h", "--help":
 		fmt.Println(usage)
+		return 0
+	case "settings":
+		fmt.Print(settings.Reference())
 		return 0
 	case "run", "demo", "info", "serve", "download", "selftest":
 		// handled below
@@ -108,6 +121,18 @@ func Main(argv []string) int {
 			dir = common.component
 		}
 		results := selftest.Run(dir)
+		// The live A/B check runs the binary itself as a
+		// subprocess (the closed-source library cannot be
+		// re-initialized in-process), so it only works from
+		// the real binary — not under `go test`.
+		if _, err := engine.Locate(dir); err == nil {
+			if exe, err := os.Executable(); err == nil {
+				if tmp, err := os.MkdirTemp("", "screenai-ab"); err == nil {
+					defer os.RemoveAll(tmp)
+					results = append(results, selftest.SettingsLiveAB(exe, dir, tmp))
+				}
+			}
+		}
 		if err := selftest.PrintAndReport(results); err != nil {
 			return 1
 		}
@@ -134,8 +159,12 @@ func Main(argv []string) int {
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		port := fs.Int("port", server.DefaultPort, "TCP port")
 		bind := fs.String("bind", "0.0.0.0", "bind address")
-		fs.Parse(args)
-		if err := server.Serve(*bind, *port, common.component); err != nil {
+		s, err := parseSettingsFlags(fs, args)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
+			return 2
+		}
+		if err := server.Serve(*bind, *port, common.component, s); err != nil {
 			fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
 			return 1
 		}
@@ -143,12 +172,15 @@ func Main(argv []string) int {
 	}
 
 	// run / demo / info all need the engine.
-	opts, engineOpts, err := parsePipeline(cmd, args, common)
+	opts, s, err := parsePipeline(cmd, args, common)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
 		return 2
 	}
-	eng, err := engine.New(engineOpts)
+	eng, err := engine.New(engine.Options{
+		ComponentDir: common.component,
+		Settings:     s,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
 		return 1
@@ -168,7 +200,7 @@ func Main(argv []string) int {
 			return 1
 		}
 	}
-	return cmdRun(eng, sources, opts)
+	return cmdRun(eng, sources, opts, s)
 }
 
 type runOptions struct {
@@ -189,6 +221,7 @@ var knownValueFlags = map[string]bool{
 	"o": true, "component": true, "maxdim": true,
 	"port": true, "bind": true, "parts": true,
 	"os": true, "arch": true, "dir": true,
+	"langs": true, "min-conf": true, "set": true, "settings": true,
 }
 
 // hoistFlags moves recognized flag tokens (and their values) in front of
@@ -246,32 +279,131 @@ func splitCommon(argv []string) (commonOpts, []string) {
 	return common, rest
 }
 
-func parsePipeline(cmd string, args []string, common commonOpts) (runOptions, engine.Options, error) {
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	outdir := fs.String("o", "", "output directory (default ./results)")
+// addSettingsFlags registers the shared settings flags on fs and
+// returns a function that folds everything into a *Settings together
+// with the per-run overrides (light / maxdim / mce booleans).
+func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
+	setFile := fs.String("settings", "", "JSON file with settings overrides")
+	langs := fs.String("langs", "", "comma-separated languages to keep (en, ja, ...)")
+	minConf := fs.Float64("min-conf", 0, "drop OCR lines below this confidence (0..1)")
 	light := fs.Bool("light", false, "use the light OCR model")
 	noMCE := fs.Bool("no-mce", false, "skip main-content extraction")
-	noHTML := fs.Bool("no-html", false, "write JSON only, no HTML reports")
 	maxdim := fs.Int("maxdim", 0, "extra pre-OCR downscale cap in px (0 = off)")
-	debug := fs.Bool("debug", false, "library debug mode")
-	if err := fs.Parse(args); err != nil {
-		return runOptions{}, engine.Options{}, err
+
+	return func() (*settings.Settings, error) {
+		s := settings.Default()
+		if *setFile != "" {
+			if err := settings.LoadJSONFile(*setFile, s); err != nil {
+				return nil, err
+			}
+		}
+		if *langs != "" {
+			parsed, err := settings.ParseLanguages(strings.Split(*langs, ","))
+			if err != nil {
+				return nil, err
+			}
+			s.Languages = parsed
+		}
+		if *minConf > 0 {
+			s.MinConfidence = *minConf
+		}
+		// --light / --maxdim / --no-mce are sugar; explicit --set wins.
+		if *light && s.OCRLightMode == nil {
+			s.OCRLightMode = boolPtr(true)
+		}
+		if *maxdim > 0 && s.MaxImageDim == 0 {
+			s.MaxImageDim = *maxdim
+		}
+		if *noMCE && !s.MCEExplicit {
+			s.MCEEnabled, s.MCEExplicit = false, true
+		}
+		return s, nil
 	}
+}
+
+// extractSetPairs pulls every --set k=v out of args (both "--set k=v"
+// and "--set k v" forms, repeated) and returns the pairs plus the
+// remaining args. The flag package is last-wins, so --set must be
+// collected before fs.Parse — this is what makes --set repeatable.
+func extractSetPairs(args []string) (pairs, rest []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--set" || a == "-set" {
+			if i+1 < len(args) {
+				pairs = append(pairs, args[i+1])
+				i++
+				continue
+			}
+		}
+		if strings.HasPrefix(a, "--set=") || strings.HasPrefix(a, "-set=") {
+			pairs = append(pairs, strings.SplitN(a, "=", 2)[1])
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return pairs, rest
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func parseSettingsFlags(fs *flag.FlagSet, args []string) (*settings.Settings, error) {
+	setPairs, filtered := extractSetPairs(args)
+	build := addSettingsFlags(fs)
+	if err := fs.Parse(filtered); err != nil {
+		return nil, err
+	}
+	s, err := build()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ParseSetList(setPairs); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func parsePipeline(cmd string, args []string, common commonOpts) (runOptions, *settings.Settings, error) {
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	outdir := fs.String("o", "", "output directory (default ./results)")
+	noHTML := fs.Bool("no-html", false, "write JSON only, no HTML reports")
+	debug := fs.Bool("debug", false, "library debug mode")
+
+	setPairs, filtered := extractSetPairs(args)
+	build := addSettingsFlags(fs)
+	if err := fs.Parse(filtered); err != nil {
+		return runOptions{}, nil, err
+	}
+	s, err := build()
+	if err != nil {
+		return runOptions{}, nil, err
+	}
+	if err := s.ParseSetList(setPairs); err != nil {
+		return runOptions{}, nil, err
+	}
+	// pull the per-run values back out of the folded settings
 	opts := runOptions{
 		sources: fs.Args(),
 		outdir:  *outdir,
-		light:   *light,
-		mce:     !*noMCE,
+		light:   s.OCRLightMode != nil && *s.OCRLightMode,
+		mce:     s.MCEEnabled,
 		html:    !*noHTML,
-		maxdim:  *maxdim,
+		maxdim:  s.MaxImageDim,
+	}
+	if s.DebugMode != nil {
+		// engine.Options.DebugMode folds this in New()
+		_ = *s.DebugMode
+	}
+	_ = debug // --debug folds into settings.DebugMode below for symmetry
+	if *debug && s.DebugMode == nil {
+		s.DebugMode = boolPtr(true)
 	}
 	if opts.outdir == "" {
 		opts.outdir = "results"
 	}
 	if len(opts.sources) == 0 && cmd == "run" {
-		return opts, engine.Options{}, fmt.Errorf("run needs at least one input file or URL")
+		return opts, s, fmt.Errorf("run needs at least one input file or URL")
 	}
-	return opts, engine.Options{ComponentDir: common.component, DebugMode: *debug}, nil
+	return opts, s, nil
 }
 
 func cmdInfo(eng *engine.Engine) int {
@@ -288,6 +420,12 @@ func cmdInfo(eng *engine.Engine) int {
 		fmt.Printf("  OCR model     : loaded (%s)\n", mode)
 	}
 	fmt.Printf("  max image dim : %d\n", eng.MaxImageDimension())
+	if eff := eng.Settings().Effective(); len(eff) > 0 {
+		fmt.Println("  active settings:")
+		for _, kv := range eff {
+			fmt.Printf("    %s\n", kv)
+		}
+	}
 	return 0
 }
 
@@ -315,12 +453,19 @@ func materializeExamples(outdir string) ([]string, error) {
 	return sources, nil
 }
 
-func cmdRun(eng *engine.Engine, sources []string, opts runOptions) int {
+func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.Settings) int {
 	if err := os.MkdirAll(opts.outdir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
 		return 1
 	}
-	popts := pipeline.Options{Light: opts.light, MaxDim: opts.maxdim, MCE: opts.mce}
+	popts := pipeline.Options{
+		Light:         opts.light,
+		MaxDim:        opts.maxdim,
+		MCE:           opts.mce,
+		Languages:     s.Languages,
+		MinConfidence: s.MinConfidence,
+		Effective:     s.Effective(),
+	}
 
 	var entries []report.Entry
 	failures := 0
@@ -334,9 +479,9 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions) int {
 		}
 		var res *pipeline.Result
 		var rep *pipeline.ReportData
-		err = eng.Session(func(s *engine.Session) error {
+		err = eng.Session(func(sess *engine.Session) error {
 			var perr error
-			res, rep, perr = pipeline.Process(s, inp, popts)
+			res, rep, perr = pipeline.Process(sess, inp, popts)
 			return perr
 		})
 		if err != nil {
@@ -355,6 +500,11 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions) int {
 		if res.OCR != nil {
 			fmt.Printf("      %d lines, %d words, conf %.3f\n",
 				len(res.OCR.Lines), res.OCR.WordCount(), res.OCR.AvgConfidence())
+		}
+		if res.Filter != nil {
+			fmt.Printf("      filter: %d/%d lines kept (langs %s, min-conf %g)\n",
+				res.Filter.LinesKept, res.Filter.LinesBefore,
+				strings.Join(res.Filter.Languages, ","), res.Filter.MinConfidence)
 		}
 	}
 

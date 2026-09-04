@@ -60,10 +60,14 @@ func loadLibrary(path string, sizeFn func(*byte) uint32, contentFn func(*byte, u
 		}
 	}
 
-	// purego callback memory is never freed, so the pointers stay valid
-	// for the lifetime of the process.
+	// The library is deliberately NEVER dlclosed: it spawns background
+	// threads (TFLite pools, the fiber scheduler) and its static
+	// destructors corrupt any later use — the same reason it cannot be
+	// re-initialized in-process (verified: a second InitOCR aborts).
+	// Chrome keeps the component loaded for the process lifetime too.
+	// purego callback memory is likewise never freed, so the pointers
+	// stay valid for the lifetime of the process.
 	return &library{
-		close:      func() error { return purego.Dlclose(handle) },
 		funcs:      f,
 		sizeCB:     purego.NewCallback(sizeFn),
 		contentCB:  purego.NewCallback(contentFn),
