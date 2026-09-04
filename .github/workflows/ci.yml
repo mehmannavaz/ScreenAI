@@ -106,10 +106,13 @@ jobs:
           curl -s http://127.0.0.1:8778/api/settings | grep -q 'mce.threshold_non_essential=0.99'
           curl -s --data-binary @out-default/examples/example_1_news_article.png \
             'http://127.0.0.1:8778/api/process?name=news.png&langs=en&min_conf=0.5' | grep -q '"filter"'
+          # NOTE: assert on JSON with jq — the wire format has no space
+          # after the colon, and grepping a live pipe SIGPIPEs curl.
           curl -s --data-binary @out-default/examples/example_1_news_article.png \
-            'http://127.0.0.1:8778/api/process?name=news.png&reader=markdown&crop=1' \
-            | grep -q '"reader_view_format": "markdown"'
-          curl -s --data-binary @out-default/examples/example_1_news_article.png \
-            'http://127.0.0.1:8778/api/process?name=news.png&reader=markdown&crop=1' \
-            | grep -q '"main_png_base64"'
+            'http://127.0.0.1:8778/api/process?name=news.png&reader=markdown&crop=1' > resp.json
+          jq -e '.reader_view_format == "markdown"' resp.json > /dev/null
+          jq -e '.reader_view | length > 0' resp.json > /dev/null
+          jq -e '.main_png_base64 | length > 1000' resp.json > /dev/null
+          jq -e '.mce.crop_box | length == 4' resp.json > /dev/null
+          jq -e '.mce.stats.selected_nodes == 15' resp.json > /dev/null
           kill $SERVER_PID
