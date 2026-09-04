@@ -37,6 +37,7 @@ $ ./screenai download              # fetch the component from Google (~124 MB, r
 $ ./screenai info                  # engine status
 $ ./screenai run photo.png page.html notes.txt -o results
 $ ./screenai run --reader --crop-main article.png   # reader view + main-content crop
+$ ./screenai run --no-boxes article.png            # HTML report without overlays
 $ ./screenai demo                   # run the bundled examples
 $ ./screenai init                   # write a documented settings.json
 $ ./screenai serve --port 8778      # expose the engine as an HTTP API
@@ -45,8 +46,9 @@ $ ./screenai selftest               # verify codecs (and the engine if present)
 ```
 
 Each run writes `{name}.ocr.json`, `{name}.mce.json`, a self-contained
-`{name}.report.html` (image with confidence-colored OCR overlay, reader
-view, outline, stats, MAIN badges), and an `index.html` hub. With
+`{name}.report.html` (the image with **overlay layers highlighting
+everything the models detected**, reader view, outline, stats, MAIN
+badges), and an `index.html` hub. With
 `--reader` it also writes `{name}.reader.md` (or `.txt` / `.html`), and
 with `--crop-main` the `{name}.main.png` crop of the main-content region.
 
@@ -73,6 +75,40 @@ what the Screen2x model actually picked, never invented:
   selection cropped pixel-exact from the image the OCR saw (4px
   padding, clamped); the server returns it as `main_png_base64`, and
   the exact box is always in `crop_box`.
+
+## HTML report overlays — see exactly what was done
+
+The HTML report embeds the exact image the models processed and draws
+**two overlay layers** on top of it, so you can see what was done, not
+just read about it:
+
+- **OCR layer**: one box per recognized line, border color encoding
+  the model's confidence for that line (green ≥ .95, blue ≥ .80,
+  yellow ≥ .60, red below). Hover a box for its text and confidence.
+- **Main-content layer**: a filled green box per Screen2x-selected
+  node (hover for role and text) plus a dashed box around the whole
+  main-content region — the exact region `--crop-main` crops.
+
+Both layers have a toggle pill above the image (click to flip a layer
+on/off while reading — no regeneration needed), and each layer can be
+switched off at generation time, in which case it is not embedded in
+the file at all:
+
+```sh
+screenai run --no-ocr-boxes photo.png   # image + MCE boxes only
+screenai run --no-mce-boxes photo.png   # image + OCR boxes only
+screenai run --no-boxes photo.png       # plain image, no overlays
+screenai run --set report.ocr_boxes=false photo.png   # same, via --set
+```
+
+| setting | default | mechanism | what it does |
+|---|---|---|---|
+| `report.ocr_boxes` | `true` | wrapper | embed the OCR line-box overlay layer in the HTML report |
+| `report.mce_boxes` | `true` | wrapper | embed the Screen2x main-content overlay layer + region box |
+
+They follow the normal precedence chain (settings.json → `--set` →
+sugar flags), so a settings.json with `"report": {"ocr_boxes": false}`
+can be re-enabled per run with `--set report.ocr_boxes=true`.
 
 ## Settings — every knob, extracted from the binary itself
 
@@ -106,6 +142,8 @@ the real binary (run `screenai selftest` to re-prove it on your machine):
 | `mce.chrome_post_process` | `true` | pbtxt | Chrome-specific post-processing |
 | `mce.crop_main` | `false` | wrapper | crop the main-content region out of the image → `<stem>.main.png` + `crop_box` (images only) |
 | `reader.format` | `none` | wrapper | export the reader view: `text` \| `markdown` \| `html` → `<stem>.reader.*` |
+| `report.ocr_boxes` | `true` | wrapper | embed the OCR line-box overlay layer in the HTML report (see [HTML report overlays](#html-report-overlays--see-exactly-what-was-done)) |
+| `report.mce_boxes` | `true` | wrapper | embed the main-content overlay layer + dashed region box in the HTML report |
 
 ### settings.json
 
@@ -125,7 +163,8 @@ and empty values mean "unset":
     "languages": ["en"],
     "min_confidence": 0.6
   },
-  "reader": { "format": "markdown" }
+  "reader": { "format": "markdown" },
+  "report": { "mce_boxes": false }
 }
 ```
 
@@ -273,7 +312,8 @@ $ ./screenai selftest     # same checks inside the shipped binary,
                           # proof that threshold overrides change the
                           # model's actual selection, settings.json
                           # template/nested-format checks, reader-view
-                          # rendering, and the main-content crop
+                          # rendering, the main-content crop, and the
+                          # HTML report overlay layers
 ```
 
 The ViewHierarchy encoder is verified byte-for-byte against golden bytes

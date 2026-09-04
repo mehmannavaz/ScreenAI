@@ -198,6 +198,11 @@ func Template() string {
   "reader": {
     "_doc": "Reader-view export of the main content: none | text | markdown | html",
     "format": "none"
+  },
+  "report": {
+    "_doc": "HTML report overlays — highlight on the image what OCR and MCE detected",
+    "ocr_boxes": true,
+    "mce_boxes": true
   }
 }
 `
@@ -215,6 +220,7 @@ func Reference() string {
 		{"OCR (Google's closed-source gocr engine)", "ocr."},
 		{"MCE (Screen2x main-content model)", "mce."},
 		{"Reader view (main-content export, wrapper side)", "reader."},
+		{"Report (HTML report overlays, wrapper side)", "report."},
 	} {
 		b.WriteString(group.title + "\n")
 		for _, d := range Descriptors {

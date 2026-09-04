@@ -69,6 +69,9 @@ flags (run/demo):
   --reader         export the reader view as markdown (see --reader-format)
   --reader-format F  reader export format: text|markdown|html
   --crop-main     crop the main-content region to <stem>.main.png
+  --no-ocr-boxes  omit the OCR box overlay from the HTML report
+  --no-mce-boxes  omit the main-content box overlay from the HTML report
+  --no-boxes      omit both overlays (= --no-ocr-boxes --no-mce-boxes)
   --print         print the reader view to stdout
   --set K=V       override any setting (repeatable; see ` + "`screenai settings`" + `)
   --settings FILE JSON file of settings overrides
@@ -322,6 +325,9 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 	readerFmt := fs.String("reader-format", "", "reader-view export: text|markdown|html")
 	reader := fs.Bool("reader", false, "export the reader view (markdown)")
 	cropMain := fs.Bool("crop-main", false, "crop the main-content region to <stem>.main.png")
+	noOCRBoxes := fs.Bool("no-ocr-boxes", false, "omit the OCR box overlay from the HTML report")
+	noMCEBoxes := fs.Bool("no-mce-boxes", false, "omit the main-content box overlay from the HTML report")
+	noBoxes := fs.Bool("no-boxes", false, "omit both overlays from the HTML report")
 
 	return func() (*settings.Settings, error) {
 		s := settings.Default()
@@ -370,6 +376,14 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 		}
 		if *cropMain {
 			s.CropMain = true
+		}
+		// --no-ocr-boxes / --no-mce-boxes / --no-boxes are sugar;
+		// explicit --set / settings.json values win.
+		if (*noOCRBoxes || *noBoxes) && s.ReportOCRBoxes == nil {
+			s.ReportOCRBoxes = boolPtr(false)
+		}
+		if (*noMCEBoxes || *noBoxes) && s.ReportMCEBoxes == nil {
+			s.ReportMCEBoxes = boolPtr(false)
 		}
 		return s, nil
 	}
@@ -550,14 +564,16 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 		return 1
 	}
 	popts := pipeline.Options{
-		Light:         opts.light,
-		MaxDim:        opts.maxdim,
-		MCE:           opts.mce,
-		Languages:     s.Languages,
-		MinConfidence: s.MinConfidence,
-		ReaderFormat:  opts.readerFmt,
-		CropMain:      opts.cropMain,
-		Effective:     s.Effective(),
+		Light:          opts.light,
+		MaxDim:         opts.maxdim,
+		MCE:            opts.mce,
+		Languages:      s.Languages,
+		MinConfidence:  s.MinConfidence,
+		ReaderFormat:   opts.readerFmt,
+		CropMain:       opts.cropMain,
+		ReportOCRBoxes: s.ReportOCRBoxes,
+		ReportMCEBoxes: s.ReportMCEBoxes,
+		Effective:      s.Effective(),
 	}
 
 	var entries []report.Entry

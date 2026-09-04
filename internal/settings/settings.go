@@ -126,6 +126,14 @@ type Settings struct {
 	// See reader.format.
 	ReaderFormat string
 
+	// ---- HTML report overlays (wrapper-side, per-run) ----
+	// ReportOCRBoxes embeds the OCR line-box overlay layer in the
+	// HTML report; ReportMCEBoxes embeds the main-content (Screen2x)
+	// overlay layer. nil = default true. See report.ocr_boxes /
+	// report.mce_boxes.
+	ReportOCRBoxes *bool
+	ReportMCEBoxes *bool
+
 	// ---- wrapper-side pre-processing ----
 	MaxImageDim int  // extra pre-OCR downscale cap, 0 = off
 	MCEEnabled  bool // run Screen2x at all
@@ -269,6 +277,19 @@ var Descriptors = []Descriptor{
 		Summary:   "Export the MCE reader view as text, markdown or html",
 		Effect:    "markdown writes <stem>.reader.md with heading levels from the tree; the reader view is distilled from the Screen2x selection",
 	},
+	// Report (HTML output)
+	{
+		Key: "report.ocr_boxes", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Highlight what OCR found: line boxes over the image in the HTML report",
+		Effect:    "false omits the OCR overlay layer entirely (not merely hidden); the image itself is still embedded",
+	},
+	{
+		Key: "report.mce_boxes", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Highlight what MCE found: Screen2x main-content boxes over the image",
+		Effect:    "false omits the green main-content overlay layer and the dashed region box; --crop-main still works",
+	},
 }
 
 // Lookup returns the descriptor for key (exact match).
@@ -409,6 +430,10 @@ func (s *Settings) Set(key, value string) error {
 		}
 		s.ReaderFormat = f
 		return nil
+	case "report.ocr_boxes":
+		return setBool(&s.ReportOCRBoxes, key, value)
+	case "report.mce_boxes":
+		return setBool(&s.ReportMCEBoxes, key, value)
 	}
 	return fmt.Errorf("setting %q is known but not implemented — this is a bug", key)
 }
@@ -487,6 +512,12 @@ func (s *Settings) Effective() []string {
 	}
 	if f, err := NormalizeReaderFormat(s.ReaderFormat); err == nil && f != "" && f != "none" {
 		add("reader.format=%s", f)
+	}
+	if s.ReportOCRBoxes != nil {
+		add("report.ocr_boxes=%v", *s.ReportOCRBoxes)
+	}
+	if s.ReportMCEBoxes != nil {
+		add("report.mce_boxes=%v", *s.ReportMCEBoxes)
 	}
 	return out
 }

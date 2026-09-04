@@ -43,6 +43,13 @@ type Options struct {
 	// CropMain crops the main-content region out of the image and
 	// returns it as MainPNGBase64 (settings key mce.crop_main).
 	CropMain bool
+	// ReportOCRBoxes embeds the OCR overlay layer in the HTML report
+	// (settings key report.ocr_boxes). nil = enabled — the default.
+	ReportOCRBoxes *bool
+	// ReportMCEBoxes embeds the Screen2x main-content overlay layer
+	// in the HTML report (settings key report.mce_boxes). nil =
+	// enabled — the default.
+	ReportMCEBoxes *bool
 	// Effective is the rendered settings list echoed into results
 	// ("key=value" strings) so every output records how it was made.
 	Effective []string
@@ -141,10 +148,15 @@ type ReportData struct {
 	MainPNG      []byte // main-content crop PNG (mce.crop_main, images only)
 	ReaderView   string // rendered reader view (reader.format)
 	ReaderFormat string // "text" | "markdown" | "html"
-	ImageW       int
-	ImageH       int
-	Elapsed      float64
-	Version      string
+	// OCRBoxesOn / MCEBoxesOn decide whether the HTML report embeds
+	// the OCR / main-content overlay layers (report.ocr_boxes and
+	// report.mce_boxes; resolved from the Options, default true).
+	OCRBoxesOn bool
+	MCEBoxesOn bool
+	ImageW     int
+	ImageH     int
+	Elapsed    float64
+	Version    string
 }
 
 // RunOCR decodes inp, obeys the library's size cap, and runs the real
@@ -426,7 +438,12 @@ func TreeForInput(inp *Input) (*pagetree.PageTree, error) {
 func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData, error) {
 	start := time.Now()
 	res := &Result{OK: true, Kind: inp.Kind, Format: inp.Format, Name: inp.Name, Settings: opts.Effective}
-	rep := &ReportData{}
+	rep := &ReportData{
+		// Overlay layers default to enabled; a nil option means
+		// "not configured" = keep the default.
+		OCRBoxesOn: opts.ReportOCRBoxes == nil || *opts.ReportOCRBoxes,
+		MCEBoxesOn: opts.ReportMCEBoxes == nil || *opts.ReportMCEBoxes,
+	}
 
 	if opts.Light != s.OCRLightMode() {
 		s.SetOCRLightMode(opts.Light)

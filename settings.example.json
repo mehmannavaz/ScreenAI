@@ -34,5 +34,10 @@
   "reader": {
     "_doc": "Reader-view export of the main content: none | text | markdown | html",
     "format": "none"
+  },
+  "report": {
+    "_doc": "HTML report overlays — highlight on the image what OCR and MCE detected",
+    "ocr_boxes": true,
+    "mce_boxes": true
   }
 }

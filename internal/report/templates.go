@@ -29,9 +29,23 @@ pre{background:#0d1117;border:1px solid #232a33;border-radius:8px;padding:14px;o
 .stat .k{font-size:11px;color:#9aa0a6;text-transform:uppercase;letter-spacing:.5px}
 .stat .v{font-size:16px;font-weight:600;margin-top:2px}
 .imgstage{position:relative;display:inline-block;max-width:100%;border:1px solid #232a33;border-radius:8px;overflow:hidden;line-height:0}
-.imgstage img{max-width:100%;image-rendering:auto}
-.overlay-box{position:absolute;border:1.5px solid #34a853;border-radius:2px;opacity:.85;mix-blend-mode:screen;cursor:crosshair}
-.overlay-box:hover{background:rgba(138,180,248,.25)}
+.imgstage img{max-width:100%;height:auto;image-rendering:auto}
+.layer{position:absolute;inset:0}
+.layer.off{display:none}
+.obox{position:absolute;border:1.5px solid #34a853;border-radius:2px;opacity:.85;mix-blend-mode:screen;cursor:crosshair}
+.obox:hover{background:rgba(138,180,248,.28);opacity:1}
+.mbox{position:absolute;border:2px solid #7ee2a8;background:rgba(126,226,168,.10);border-radius:2px;opacity:.9;cursor:crosshair}
+.mbox:hover{background:rgba(126,226,168,.30);opacity:1}
+.cropbox{position:absolute;border:2px dashed #fdd663;border-radius:4px;opacity:.9;cursor:crosshair}
+.cropbox:hover{background:rgba(253,214,99,.12)}
+.stagebar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 4px}
+.lay-toggle{background:#1b2129;border:1px solid #2a3341;border-radius:999px;padding:4px 12px;font-size:13px;color:#c3c7cb;cursor:pointer;user-select:none}
+.lay-toggle:hover{border-color:#3b4757}
+.lay-toggle.off{opacity:.45}
+.lay-toggle.ocr::before,.lay-toggle.mce::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px}
+.lay-toggle.ocr::before{background:#8ab4f8}
+.lay-toggle.mce::before{background:#7ee2a8}
+.legend{color:#9aa0a6;font-size:12.5px;margin:4px 0 0}
 .badge{font-size:10px;font-weight:700;border-radius:3px;padding:1px 6px;letter-spacing:.5px}
 .badge.main{background:#1a3a2a;color:#7ee2a8;border:1px solid #2b5a41}
 .badge.off{color:#3c4043}
@@ -80,16 +94,39 @@ var reportTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
   <div class="stat"><div class="k">avg confidence</div><div class="v">{{.OCR.AvgConf}}</div></div>
   <div class="stat"><div class="k">languages</div><div class="v">{{if .OCR.Languages}}{{.OCR.Languages}}{{else}}&mdash;{{end}}</div></div>
 </div>
-
-{{if .OCR.HasImage}}
-<div class="card"><b>{{if .OCR.HasBoxes}}Word &amp; line boxes{{else}}Input image{{end}}</b>
-{{if .OCR.HasBoxes}} — box color encodes confidence (green &ge; .95, blue &ge; .80, yellow &ge; .60, red below). Hover a box for its text.{{else}} — the OCR model found no text in this image.{{end}}
-<div style="margin-top:12px">
-<div class="imgstage"><img src="{{.OCR.ImageURI}}" alt="input">
-{{range .OCR.Boxes}}<div class="overlay-box" title="{{.Title}}" style="{{.Style}}border-color:{{.Color}}"></div>{{end}}
-</div></div></div>
 {{end}}
 
+{{if .Stage.HasImage}}
+<div class="card"><b>{{if .Stage.HasLayers}}What the models detected{{else}}Input image{{end}}</b> — overlays on the exact image OCR processed{{if .Stage.HasLayers}}; click a pill to toggle a layer, hover a box for its text{{end}}
+{{if .Stage.HasLayers}}
+<div class="stagebar">
+{{if .Stage.HasOCR}}<span class="lay-toggle ocr" data-layer="lay-ocr" role="button" tabindex="0">OCR lines ({{.Stage.OCRCount}})</span>{{end}}
+{{if .Stage.HasMCE}}<span class="lay-toggle mce" data-layer="lay-mce" role="button" tabindex="0">Main content ({{.Stage.MCECount}})</span>{{end}}
+</div>
+<p class="legend">box color = OCR confidence (green &ge; .95, blue &ge; .80, yellow &ge; .60, red below) · filled green = Screen2x main content · dashed = main-content region</p>
+{{else}}
+<p class="legend">the OCR model found no regions in this image</p>
+{{end}}
+<div style="margin-top:12px">
+<div class="imgstage"><img src="{{.Stage.ImageURI}}" alt="input">
+{{if .Stage.HasOCR}}<div class="layer" id="lay-ocr">{{range .Stage.OCRBoxes}}<div class="obox" title="{{.Title}}" style="{{.Style}}"></div>{{end}}</div>{{end}}
+{{if .Stage.HasMCE}}<div class="layer" id="lay-mce">{{range .Stage.MCEBoxes}}<div class="mbox" title="{{.Title}}" style="{{.Style}}"></div>{{end}}{{if .Stage.HasCrop}}<div class="cropbox" title="main content region (what --crop-main crops)" style="{{.Stage.CropStyle}}"></div>{{end}}</div>{{end}}
+</div></div></div>
+<script>
+(function(){
+  var els=document.querySelectorAll('.lay-toggle');
+  for(var i=0;i<els.length;i++){
+    els[i].addEventListener('click',function(){
+      this.classList.toggle('off');
+      var l=document.getElementById(this.getAttribute('data-layer'));
+      if(l)l.classList.toggle('off');
+    });
+  }
+})();
+</script>
+{{end}}
+
+{{if .HasOCR}}
 <div class="card"><b>Recognized text</b><pre>{{if .OCR.PlainText}}{{.OCR.PlainText}}{{else}}(no text detected){{end}}</pre></div>
 
 {{if .OCR.Lines}}

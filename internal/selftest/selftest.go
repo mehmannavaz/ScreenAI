@@ -21,6 +21,7 @@ import (
 	"github.com/mehmannavaz/ScreenAI/internal/pagetree"
 	"github.com/mehmannavaz/ScreenAI/internal/pb"
 	"github.com/mehmannavaz/ScreenAI/internal/pipeline"
+	"github.com/mehmannavaz/ScreenAI/internal/report"
 	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
@@ -62,6 +63,7 @@ func Run(componentDir string) []Result {
 	check("settings-json-nested", testSettingsJSONNested)
 	check("reader-render", testReaderRender)
 	check("mce-crop", testCropMainContent)
+	check("report-overlay", testReportOverlay)
 	if _, err := engine.Locate(componentDir); err == nil {
 		check("engine-smoke", func() error { return engineSmoke(componentDir) })
 		check("settings-patchers", func() error { return settingsSmoke(componentDir) })
@@ -69,6 +71,55 @@ func Run(componentDir string) []Result {
 		fmt.Println("note: component not found — skipping the live engine smoke test")
 	}
 	return results
+}
+
+// testReportOverlay verifies the HTML report overlay stage: OCR and
+// main-content boxes are actually embedded and positioned (the style
+// attribute must survive html/template, which used to replace it with
+// ZgotmplZ), and the report.* flags omit the layers entirely.
+func testReportOverlay() error {
+	box := func(x, y, w, h int) *pb.Rect { return &pb.Rect{X: x, Y: y, Width: w, Height: h} }
+	crop := [4]int{100, 200, 600, 800}
+	data := &pipeline.ReportData{
+		OCRBoxesOn: true, MCEBoxesOn: true,
+		ImageW: 1000, ImageH: 2000, PNGURI: "data:image/png;base64,AAAA",
+		OCR: &pb.Annotation{
+			Width: 1000, Height: 2000,
+			Lines: []pb.Line{{Text: "Hello", Confidence: .99, Box: box(100, 200, 500, 40)}},
+		},
+		MCE: &pipeline.MCE{
+			Ran: true, ContentAXNodeIDs: []int{107}, NodeCount: 2,
+			Nodes: []pipeline.MCENode{
+				{AXNodeID: 105, Role: "banner", Box: [4]int{10, 10, 90, 90}},
+				{AXNodeID: 107, Role: "staticText", Text: "main", Box: [4]int{100, 200, 600, 800}},
+			},
+			CropBox: &crop,
+		},
+	}
+	meta := report.MetaView{Kind: "image", Format: "png", Version: "v", Elapsed: "0s"}
+	res := &pipeline.Result{OK: true, Format: "png"}
+
+	html := report.Build("t", meta, data, res)
+	if strings.Contains(html, "ZgotmplZ") {
+		return errors.New("overlay style replaced by ZgotmplZ")
+	}
+	for _, want := range []string{`id="lay-ocr"`, `id="lay-mce"`, `class="cropbox"`, "left:10.000%", `class="lay-toggle mce"`} {
+		if !strings.Contains(html, want) {
+			return fmt.Errorf("overlay stage missing %q", want)
+		}
+	}
+
+	data.OCRBoxesOn, data.MCEBoxesOn = false, false
+	html = report.Build("t", meta, data, res)
+	for _, banned := range []string{`id="lay-ocr"`, `id="lay-mce"`, `class="obox"`, `class="mbox"`, `class="cropbox"`} {
+		if strings.Contains(html, banned) {
+			return fmt.Errorf("layer %q embedded despite report.*=false", banned)
+		}
+	}
+	if !strings.Contains(html, `src="data:image/png;base64,AAAA"`) {
+		return errors.New("image itself must stay embedded when overlays are off")
+	}
+	return nil
 }
 
 // testSettingsTemplate verifies the generated settings.json template

@@ -42,12 +42,39 @@ func Stem(name string) string {
 	return re.ReplaceAllString(base, "_")
 }
 
-// BoxView is one OCR overlay box positioned in percentages of the
-// image.
+// BoxView is one overlay box positioned in percentages of the image.
+// Style carries the complete CSS declaration list (position and border
+// color) as a template.CSS value: html/template passes trusted CSS
+// through unchanged inside a style attribute, while plain strings and
+// template.HTMLAttr values are replaced with "ZgotmplZ" — which is
+// exactly how every overlay box used to silently vanish.
 type BoxView struct {
-	Style template.HTMLAttr
+	Style template.CSS
 	Title string
-	Color string
+}
+
+// StageView is the image stage: the embedded preview of the image the
+// models actually saw, with the OCR and main-content overlay layers
+// drawn on top. Each layer can be toggled in-page; whether a layer is
+// embedded at all is controlled by report.ocr_boxes / report.mce_boxes.
+type StageView struct {
+	HasImage bool
+	ImageURI template.URL
+	ImageW   int
+	ImageH   int
+
+	HasOCR   bool // OCR layer embedded (report.ocr_boxes)
+	OCRCount int
+	OCRBoxes []BoxView
+
+	HasMCE   bool // main-content layer embedded (report.mce_boxes)
+	MCECount int
+	MCEBoxes []BoxView
+
+	HasCrop   bool         // dashed main-content region (union box)
+	CropStyle template.CSS // full style for the crop box
+
+	HasLayers bool // any overlay layer present (card caption)
 }
 
 // LineView is one row of the OCR lines table.
@@ -67,14 +94,9 @@ type StatsView struct {
 	Value template.HTML
 }
 
-// OCRView is the OCR section view model.
+// OCRView is the OCR section view model. (The image and its overlay
+// layers live in StageView.)
 type OCRView struct {
-	HasImage  bool
-	ImageURI  template.URL
-	ImageW    int
-	ImageH    int
-	HasBoxes  bool
-	Boxes     []BoxView
 	PlainText string
 	Lines     []LineView
 	LineCount int
@@ -141,6 +163,7 @@ type ReportView struct {
 	Stamps   string
 	HasOCR   bool
 	HasMCE   bool
+	Stage    StageView
 	OCR      OCRView
 	MCE      MCEView
 	Meta     MetaView
@@ -160,6 +183,9 @@ func Build(stem string, meta MetaView, ocr *pipeline.ReportData, res *pipeline.R
 	view.Subtitle = fmt.Sprintf("%s input · %s · library %s · %s · %s",
 		meta.Format, meta.Kind, meta.Version, meta.Elapsed, view.Stamps)
 
+	if ocr != nil {
+		buildStageView(&view.Stage, ocr)
+	}
 	if ocr != nil && ocr.OCR != nil {
 		view.HasOCR = true
 		buildOCRView(&view.OCR, ocr)
@@ -217,32 +243,6 @@ func buildOCRView(view *OCRView, data *pipeline.ReportData) {
 	view.AvgConf = fmt.Sprintf("%.3f", ann.AvgConfidence())
 	view.Languages = strings.Join(ann.Languages(), ", ")
 	view.PlainText = ann.PlainText()
-
-	if data.PNGURI != "" {
-		view.HasImage = true
-		view.ImageURI = template.URL(data.PNGURI)
-		view.ImageW, view.ImageH = data.ImageW, data.ImageH
-		if view.ImageW > 0 && view.ImageH > 0 && len(ann.Lines) > 0 {
-			view.HasBoxes = true
-			for i := range ann.Lines {
-				ln := &ann.Lines[i]
-				if ln.Box == nil {
-					continue
-				}
-				b := ln.Box
-				view.Boxes = append(view.Boxes, BoxView{
-					Style: template.HTMLAttr(fmt.Sprintf(
-						"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%",
-						float64(b.X)*100/float64(view.ImageW),
-						float64(b.Y)*100/float64(view.ImageH),
-						float64(maxInt(b.Width, 1))*100/float64(view.ImageW),
-						float64(maxInt(b.Height, 1))*100/float64(view.ImageH))),
-					Title: fmt.Sprintf("%s (conf %.2f)", ln.Text, ln.Confidence),
-					Color: confColor(float64(ln.Confidence)),
-				})
-			}
-		}
-	}
 
 	for i := range ann.Lines {
 		ln := &ann.Lines[i]
@@ -310,6 +310,108 @@ func buildMCEView(view *MCEView, mce *pipeline.MCE) {
 			Text: text,
 		})
 	}
+}
+
+// buildStageView fills the image stage: the embedded preview plus the
+// OCR overlay layer (report.ocr_boxes) and the main-content overlay
+// layer (report.mce_boxes). Both flags come from the ReportData, which
+// resolves them from the settings — so a disabled layer is not merely
+// hidden, it is not embedded in the file at all.
+func buildStageView(view *StageView, data *pipeline.ReportData) {
+	if data.PNGURI == "" || data.ImageW <= 0 || data.ImageH <= 0 {
+		return
+	}
+	view.HasImage = true
+	view.ImageURI = template.URL(data.PNGURI)
+	view.ImageW, view.ImageH = data.ImageW, data.ImageH
+
+	// OCR layer — one box per recognized line, border color encoding
+	// the model's confidence for that line.
+	if data.OCRBoxesOn && data.OCR != nil {
+		w, h := float64(view.ImageW), float64(view.ImageH)
+		for i := range data.OCR.Lines {
+			ln := &data.OCR.Lines[i]
+			if ln.Box == nil {
+				continue
+			}
+			b := ln.Box
+			view.OCRBoxes = append(view.OCRBoxes, BoxView{
+				Style: template.CSS(fmt.Sprintf(
+					"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%;border-color:%s",
+					float64(b.X)*100/w,
+					float64(b.Y)*100/h,
+					float64(maxInt(b.Width, 1))*100/w,
+					float64(maxInt(b.Height, 1))*100/h,
+					confColor(float64(ln.Confidence)))),
+				Title: fmt.Sprintf("%s (conf %.2f)", ln.Text, ln.Confidence),
+			})
+		}
+		if len(view.OCRBoxes) > 0 {
+			view.HasOCR = true
+			view.OCRCount = len(view.OCRBoxes)
+		}
+	}
+
+	// Main-content layer — one green box per Screen2x-selected node,
+	// plus the dashed union box (the region mce.crop_main crops).
+	if data.MCEBoxesOn && data.MCE != nil && data.MCE.Ran {
+		selected := map[int]bool{}
+		for _, ax := range data.MCE.ContentAXNodeIDs {
+			selected[ax] = true
+		}
+		w, h := float64(view.ImageW), float64(view.ImageH)
+		for _, n := range data.MCE.Nodes {
+			if !selected[n.AXNodeID] {
+				continue
+			}
+			if n.Box[2] <= n.Box[0] || n.Box[3] <= n.Box[1] {
+				continue // degenerate / boxless node
+			}
+			title := n.Role
+			if text := firstNonEmpty(n.Text, n.SubtreeText); text != "" {
+				title += " — " + truncateText(text, 60)
+			}
+			view.MCEBoxes = append(view.MCEBoxes, BoxView{
+				Style: template.CSS(fmt.Sprintf(
+					"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%",
+					float64(n.Box[0])*100/w,
+					float64(n.Box[1])*100/h,
+					float64(n.Box[2]-n.Box[0])*100/w,
+					float64(n.Box[3]-n.Box[1])*100/h)),
+				Title: title,
+			})
+		}
+		if len(view.MCEBoxes) > 0 {
+			view.HasMCE = true
+			view.MCECount = len(view.MCEBoxes)
+		}
+		if cb := data.MCE.CropBox; cb != nil && (*cb)[2] > (*cb)[0] && (*cb)[3] > (*cb)[1] {
+			view.HasCrop = true
+			view.CropStyle = template.CSS(fmt.Sprintf(
+				"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%",
+				float64((*cb)[0])*100/w,
+				float64((*cb)[1])*100/h,
+				float64((*cb)[2]-(*cb)[0])*100/w,
+				float64((*cb)[3]-(*cb)[1])*100/h))
+		}
+	}
+	view.HasLayers = view.HasOCR || view.HasMCE
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func confColor(conf float64) string {
