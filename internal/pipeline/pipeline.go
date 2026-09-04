@@ -11,6 +11,7 @@ import (
 	"github.com/mehmannavaz/ScreenAI/internal/imaging"
 	"github.com/mehmannavaz/ScreenAI/internal/pagetree"
 	"github.com/mehmannavaz/ScreenAI/internal/pb"
+	"github.com/mehmannavaz/ScreenAI/internal/settings"
 )
 
 // Size caps shared by the CLI and the HTTP server.
@@ -36,6 +37,12 @@ type Options struct {
 	// MinConfidence drops OCR lines below this confidence
 	// (settings key ocr.min_confidence; 0 = keep everything).
 	MinConfidence float64
+	// ReaderFormat, when "text"/"markdown"/"html", renders the MCE
+	// reader view into Result.ReaderView (settings key reader.format).
+	ReaderFormat string
+	// CropMain crops the main-content region out of the image and
+	// returns it as MainPNGBase64 (settings key mce.crop_main).
+	CropMain bool
 	// Effective is the rendered settings list echoed into results
 	// ("key=value" strings) so every output records how it was made.
 	Effective []string
@@ -57,18 +64,34 @@ type MCENode struct {
 	SubtreeText string `json:"subtree_text"`
 	Box         [4]int `json:"box"`
 	Level       *int   `json:"level"`
+	Selected    bool   `json:"selected"` // part of the main content?
+}
+
+// MCEStats summarises what the Screen2x selection kept: how much of
+// the tree is main content and how much there is to read.
+type MCEStats struct {
+	SelectedNodes int     `json:"selected_nodes"`
+	TotalNodes    int     `json:"total_nodes"`
+	KeptRatio     float64 `json:"kept_ratio"`
+	ClutterPct    float64 `json:"clutter_dropped_pct"`
+	ReaderWords   int     `json:"reader_words"`
+	ReaderChars   int     `json:"reader_chars"`
+	ReadingSec    int     `json:"reading_seconds"` // at 200 words/minute
 }
 
 // MCE is the result of the Screen2x main-content run.
 type MCE struct {
-	Ran              bool         `json:"ran"`
-	Elapsed          float64      `json:"elapsed"`
-	ContentAXNodeIDs []int        `json:"content_axnode_ids"`
-	ContentProtoIDs  []int        `json:"content_proto_ids"`
-	TreeSize         [2]int       `json:"tree_size"`
-	NodeCount        int          `json:"node_count"`
-	Reader           []ReaderPart `json:"reader"`
-	Nodes            []MCENode    `json:"nodes"`
+	Ran              bool          `json:"ran"`
+	Elapsed          float64       `json:"elapsed"`
+	ContentAXNodeIDs []int         `json:"content_axnode_ids"`
+	ContentProtoIDs  []int         `json:"content_proto_ids"`
+	TreeSize         [2]int        `json:"tree_size"`
+	NodeCount        int           `json:"node_count"`
+	Reader           []ReaderPart  `json:"reader"`
+	Nodes            []MCENode     `json:"nodes"`
+	Outline          []OutlineItem `json:"outline,omitempty"`
+	Stats            *MCEStats     `json:"stats,omitempty"`
+	CropBox          *[4]int       `json:"crop_box,omitempty"` // exact union box of the selection, image pixels
 
 	MainNodeProtoID *int   `json:"main_node_proto_id,omitempty"`
 	MainAXNodeID    *int   `json:"main_axnode_id,omitempty"`
@@ -79,19 +102,22 @@ type MCE struct {
 // Result is the JSON structure the HTTP server and the HTML reporter
 // consume: one processed input.
 type Result struct {
-	OK           bool           `json:"ok"`
-	Kind         Kind           `json:"kind"`
-	Format       string         `json:"format"`
-	Name         string         `json:"name"`
-	Width        int            `json:"width"`
-	Height       int            `json:"height"`
-	ElapsedMS    int            `json:"elapsed_ms"`
-	OCR          *pb.Annotation `json:"ocr,omitempty"`
-	MCE          *MCE           `json:"mce,omitempty"`
-	PNGBase64    string         `json:"png_base64,omitempty"`
-	DownscaledTo []int          `json:"downscaled_to,omitempty"`
-	Filter       *FilterStats   `json:"filter,omitempty"`
-	Settings     []string       `json:"settings,omitempty"`
+	OK            bool           `json:"ok"`
+	Kind          Kind           `json:"kind"`
+	Format        string         `json:"format"`
+	Name          string         `json:"name"`
+	Width         int            `json:"width"`
+	Height        int            `json:"height"`
+	ElapsedMS     int            `json:"elapsed_ms"`
+	OCR           *pb.Annotation `json:"ocr,omitempty"`
+	MCE           *MCE           `json:"mce,omitempty"`
+	PNGBase64     string         `json:"png_base64,omitempty"`
+	MainPNGBase64 string         `json:"main_png_base64,omitempty"`
+	ReaderView    string         `json:"reader_view,omitempty"`
+	ReaderFormat  string         `json:"reader_view_format,omitempty"`
+	DownscaledTo  []int          `json:"downscaled_to,omitempty"`
+	Filter        *FilterStats   `json:"filter,omitempty"`
+	Settings      []string       `json:"settings,omitempty"`
 }
 
 // FilterStats reports what the language/confidence post-filters kept.
@@ -109,13 +135,16 @@ type FilterStats struct {
 // ReportData is the side-channel for the file reporter (not part of the
 // JSON contract).
 type ReportData struct {
-	OCR     *pb.Annotation
-	MCE     *MCE
-	PNGURI  string // data: URI of exactly what OCR saw (images only)
-	ImageW  int
-	ImageH  int
-	Elapsed float64
-	Version string
+	OCR          *pb.Annotation
+	MCE          *MCE
+	PNGURI       string // data: URI of exactly what OCR saw (images only)
+	MainPNG      []byte // main-content crop PNG (mce.crop_main, images only)
+	ReaderView   string // rendered reader view (reader.format)
+	ReaderFormat string // "text" | "markdown" | "html"
+	ImageW       int
+	ImageH       int
+	Elapsed      float64
+	Version      string
 }
 
 // RunOCR decodes inp, obeys the library's size cap, and runs the real
@@ -206,6 +235,30 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 
 	// Reader view: top-most selected nodes — skip nodes already inside a
 	// selected ancestor so no text appears twice.
+	//
+	// Heading detection: Screen2x usually selects the TEXT nodes, not
+	// the heading containers around them, so a part whose nearest
+	// heading ancestor (self included) is an h1..h6 renders as a
+	// heading of that level. Multiple selected children of the same
+	// heading merge into one part — they are one heading in the source.
+	headingAncestor := func(start *pagetree.Node) (id, level int, ok bool) {
+		cur := start
+		for cur != nil {
+			if cur.Role == "heading" {
+				lvl := 1
+				if cur.Level != nil {
+					lvl = clamp(*cur.Level, 1, 6)
+				}
+				return cur.ID, lvl, true
+			}
+			if cur.ParentID < 0 || cur.ParentID >= len(tree.Nodes) {
+				return 0, 0, false
+			}
+			cur = tree.Nodes[cur.ParentID].Node
+		}
+		return 0, 0, false
+	}
+	headingPart := map[int]int{} // heading node id → index in res.Reader
 	for i := range tree.Nodes {
 		node := tree.Nodes[i].Node
 		if !selected[node.AXNodeID] {
@@ -224,9 +277,20 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		if inside {
 			continue
 		}
-		if text := pagetree.SubtreeText(node); text != "" {
-			res.Reader = append(res.Reader, ReaderPart{Role: node.Role, Level: node.Level, Text: text})
+		text := pagetree.SubtreeText(node)
+		if text == "" {
+			continue
 		}
+		if hid, lvl, isHeading := headingAncestor(node); isHeading {
+			if idx, seen := headingPart[hid]; seen {
+				res.Reader[idx].Text = strings.TrimSpace(res.Reader[idx].Text + " " + text)
+				continue
+			}
+			headingPart[hid] = len(res.Reader)
+			res.Reader = append(res.Reader, ReaderPart{Role: "heading", Level: &lvl, Text: text})
+			continue
+		}
+		res.Reader = append(res.Reader, ReaderPart{Role: node.Role, Level: node.Level, Text: text})
 	}
 
 	for i := range tree.Nodes {
@@ -238,7 +302,67 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 			SubtreeText: pagetree.SubtreeText(node),
 			Box:         tree.Nodes[i].BoxPixels,
 			Level:       node.Level,
+			Selected:    selected[node.AXNodeID],
 		})
+	}
+
+	// Outline: the headings of the reader view, in reading order —
+	// exactly the structure a markdown/html export will emit.
+	for i := range res.Reader {
+		if res.Reader[i].Role != "heading" {
+			continue
+		}
+		level := 1
+		if res.Reader[i].Level != nil {
+			level = clamp(*res.Reader[i].Level, 1, 6)
+		}
+		res.Outline = append(res.Outline, OutlineItem{Level: level, Text: oneLine(res.Reader[i].Text)})
+	}
+
+	// Stats: how much of the tree is main content, how much to read.
+	readerWords, readerChars := 0, 0
+	for _, part := range res.Reader {
+		readerWords += len(strings.Fields(part.Text))
+		readerChars += len(part.Text)
+	}
+	total := len(tree.Nodes)
+	if total > 0 {
+		s := &MCEStats{
+			SelectedNodes: len(contentIDs),
+			TotalNodes:    total,
+			KeptRatio:     float64(len(contentIDs)) / float64(total),
+			ReaderWords:   readerWords,
+			ReaderChars:   readerChars,
+			ReadingSec:    (readerWords*60 + ReadingWordsPerMinute - 1) / ReadingWordsPerMinute,
+		}
+		s.ClutterPct = round1((1 - s.KeptRatio) * 100)
+		s.KeptRatio = round3(s.KeptRatio)
+		res.Stats = s
+	}
+
+	// Exact union box of the selection, in image pixels — what
+	// mce.crop_main crops out (padded slightly at crop time).
+	if len(protoIDs) > 0 {
+		var box *[4]int
+		for _, p := range protoIDs {
+			if p < 0 || p >= len(tree.Nodes) {
+				continue
+			}
+			nb := tree.Nodes[p].BoxPixels
+			if nb[2] <= nb[0] || nb[3] <= nb[1] {
+				continue // degenerate/no box
+			}
+			if box == nil {
+				b := nb
+				box = &b
+				continue
+			}
+			box[0] = minInt(box[0], nb[0])
+			box[1] = minInt(box[1], nb[1])
+			box[2] = maxInt(box[2], nb[2])
+			box[3] = maxInt(box[3], nb[3])
+		}
+		res.CropBox = box
 	}
 
 	if len(protoIDs) > 0 {
@@ -262,6 +386,24 @@ func firstText(tree *pagetree.PageTree, protoID int) string {
 		}
 	})
 	return text
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func round1(v float64) float64 {
+	return float64(int(v*10+0.5)) / 10
 }
 
 // TreeForInput builds the page tree for non-image inputs.
@@ -324,6 +466,20 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 					pipelineErr = err
 				} else {
 					res.MCE, rep.MCE = mce, mce
+					finishMCEDerived(res, rep, mce, opts)
+					// The crop needs the image the OCR saw, so it can only
+					// happen on the image path — boxes line up pixel-exact.
+					if opts.CropMain && mce.CropBox != nil {
+						// Crop failures (degenerate boxes) are
+						// non-fatal: the run still succeeds, the
+						// crop file is simply not produced.
+						if png, cerr := CropMainContent(img, mce); cerr == nil {
+							rep.MainPNG = png
+							if len(png) <= MaxPNGBase64 {
+								res.MainPNGBase64 = base64.StdEncoding.EncodeToString(png)
+							}
+						}
+					}
 				}
 			}
 		}
@@ -337,6 +493,7 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 				pipelineErr = err
 			} else {
 				res.MCE, rep.MCE = mce, mce
+				finishMCEDerived(res, rep, mce, opts)
 				res.Width, res.Height = tree.TreeW, tree.TreeH
 			}
 		}
@@ -349,6 +506,17 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 		return res, rep, pipelineErr
 	}
 	return res, rep, nil
+}
+
+// finishMCEDerived renders the reader-view export (reader.format)
+// shared by both the image and the document paths. The main-content
+// crop is image-only and handled where the pixels are in scope.
+func finishMCEDerived(res *Result, rep *ReportData, mce *MCE, opts Options) {
+	if f, err := settings.NormalizeReaderFormat(opts.ReaderFormat); err == nil && (f == "text" || f == "markdown" || f == "html") {
+		res.ReaderView = RenderReaderView(mce, f)
+		res.ReaderFormat = f
+		rep.ReaderView, rep.ReaderFormat = res.ReaderView, f
+	}
 }
 
 // FilterAnnotation applies the language and confidence post-filters to

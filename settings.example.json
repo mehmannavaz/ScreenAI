@@ -1,0 +1,38 @@
+{
+  "_readme": [
+    "screenai settings.json — example configuration",
+    "Copy to ./settings.json (auto-loaded) or point $SCREENAI_SETTINGS at it,",
+    "or pass explicitly with --settings settings.example.json",
+    "Delete what you do not need; every value shown is the stock default.",
+    "Keys starting with '_' are documentation and are ignored.",
+    "Formats: flat (\"mce.threshold_non_essential\": 0.99) or nested groups (below).",
+    "Empty arrays or strings mean 'leave unset'.",
+    "Full reference: screenai settings"
+  ],
+  "ocr": {
+    "_doc": "Google gocr engine (closed-source) — read at InitOCR, restart to change",
+    "light_mode": false,
+    "debug_mode": false,
+    "scripts": [],
+    "languages": [],
+    "min_confidence": 0,
+    "max_image_dimension": 0,
+    "tflite_interpreter_pool_min_size": 4,
+    "max_in_flight": 1,
+    "detection_score_threshold": 0.5
+  },
+  "mce": {
+    "_doc": "Screen2x main-content model — read at InitMainContentExtraction, restart to change",
+    "enabled": true,
+    "threshold_non_essential": 0.65,
+    "threshold_headline": 0,
+    "threshold_main": 0,
+    "num_threads": 1,
+    "chrome_post_process": true,
+    "crop_main": false
+  },
+  "reader": {
+    "_doc": "Reader-view export of the main content: none | text | markdown | html",
+    "format": "none"
+  }
+}

@@ -6,6 +6,7 @@
 //	screenai demo            run the bundled examples
 //	screenai info            show library + component info
 //	screenai settings        print the full settings reference
+//	screenai init            write a documented settings.json
 //	screenai serve           serve the engine as an HTTP API
 //	screenai download        fetch the Screen AI component from Google
 //	screenai selftest        verify codecs (and the engine when present)
@@ -40,13 +41,22 @@ usage:
 
 commands:
   run FILE...     process input files or http(s):// URLs (default command)
-  demo            run the bundled examples
+  demo            run the bundled examples (reader view enabled)
   info            show library + component info
   settings        print every available setting with defaults + effects
+                  --json  machine-readable reference + settings.json template
+  init [FILE]     write a fully documented settings.json (default
+                  ./settings.json; --force to overwrite)
   serve           serve the engine as an HTTP API (default port 8778)
   download        fetch the Screen AI component from Google (~124 MB)
   selftest        verify codecs (and the engine when present)
   version         print the version
+
+settings.json:
+  ./settings.json (or $SCREENAI_SETTINGS) is auto-loaded when present —
+  create one with ` + "`screenai init`" + `. It may be flat
+  ("mce.threshold_non_essential": 0.99) or nested ("mce": {...}).
+  --settings FILE and --set k=v override it, in that order.
 
 flags (run/demo):
   -o DIR          output directory (default ./results)
@@ -56,6 +66,10 @@ flags (run/demo):
   --maxdim PX     extra pre-OCR downscale cap (0 = off)
   --langs A,B     keep only OCR lines in these languages (en, ja, ...)
   --min-conf F    drop OCR lines below confidence F (0..1)
+  --reader         export the reader view as markdown (see --reader-format)
+  --reader-format F  reader export format: text|markdown|html
+  --crop-main     crop the main-content region to <stem>.main.png
+  --print         print the reader view to stdout
   --set K=V       override any setting (repeatable; see ` + "`screenai settings`" + `)
   --settings FILE JSON file of settings overrides
   --debug         library debug mode (dumps i/o protos to tmp)
@@ -69,8 +83,10 @@ examples:
   screenai info
   screenai run photo.png page.html notes.txt
   screenai run --langs en --min-conf 0.8 scan.png
+  screenai run --reader --crop-main article.png
   screenai run --set mce.threshold_non_essential=0.9 photo.png
   screenai run --set ocr.scripts=und,Jpan,Kore,Hani japan.jpg
+  screenai init && screenai run page.html
   screenai demo
   screenai serve --port 8778 --set mce.threshold_non_essential=0.85
 
@@ -99,8 +115,14 @@ func Main(argv []string) int {
 		fmt.Println(usage)
 		return 0
 	case "settings":
-		fmt.Print(settings.Reference())
+		if len(args) > 0 && (args[0] == "--json" || args[0] == "-json") {
+			fmt.Println(settings.ReferenceJSON())
+		} else {
+			fmt.Print(settings.Reference())
+		}
 		return 0
+	case "init":
+		return cmdInit(args)
 	case "run", "demo", "info", "serve", "download", "selftest":
 		// handled below
 	default:
@@ -204,12 +226,15 @@ func Main(argv []string) int {
 }
 
 type runOptions struct {
-	sources []string
-	outdir  string
-	light   bool
-	mce     bool
-	html    bool
-	maxdim  int
+	sources     []string
+	outdir      string
+	light       bool
+	mce         bool
+	html        bool
+	maxdim      int
+	readerFmt   string
+	cropMain    bool
+	printReader bool
 }
 
 type commonOpts struct {
@@ -217,11 +242,14 @@ type commonOpts struct {
 }
 
 // knownValueFlags are the flags that take a separate value argument.
+// (--reader and --crop-main are plain booleans — they must NOT be
+// listed here, or `--reader photo.png` would swallow the file name.)
 var knownValueFlags = map[string]bool{
 	"o": true, "component": true, "maxdim": true,
 	"port": true, "bind": true, "parts": true,
 	"os": true, "arch": true, "dir": true,
 	"langs": true, "min-conf": true, "set": true, "settings": true,
+	"reader-format": true,
 }
 
 // hoistFlags moves recognized flag tokens (and their values) in front of
@@ -281,7 +309,9 @@ func splitCommon(argv []string) (commonOpts, []string) {
 
 // addSettingsFlags registers the shared settings flags on fs and
 // returns a function that folds everything into a *Settings together
-// with the per-run overrides (light / maxdim / mce booleans).
+// with the per-run overrides (light / maxdim / mce / reader / crop
+// booleans). The auto-discovered settings.json is loaded FIRST —
+// everything else overrides it.
 func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 	setFile := fs.String("settings", "", "JSON file with settings overrides")
 	langs := fs.String("langs", "", "comma-separated languages to keep (en, ja, ...)")
@@ -289,9 +319,19 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 	light := fs.Bool("light", false, "use the light OCR model")
 	noMCE := fs.Bool("no-mce", false, "skip main-content extraction")
 	maxdim := fs.Int("maxdim", 0, "extra pre-OCR downscale cap in px (0 = off)")
+	readerFmt := fs.String("reader-format", "", "reader-view export: text|markdown|html")
+	reader := fs.Bool("reader", false, "export the reader view (markdown)")
+	cropMain := fs.Bool("crop-main", false, "crop the main-content region to <stem>.main.png")
 
 	return func() (*settings.Settings, error) {
 		s := settings.Default()
+		// 1. auto-discovered settings.json — lowest precedence
+		if path, err := settings.LoadAuto(s); err != nil {
+			return nil, err
+		} else if path != "" {
+			fmt.Printf("settings: loaded %s\n", path)
+		}
+		// 2. explicit --settings FILE
 		if *setFile != "" {
 			if err := settings.LoadJSONFile(*setFile, s); err != nil {
 				return nil, err
@@ -307,7 +347,8 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 		if *minConf > 0 {
 			s.MinConfidence = *minConf
 		}
-		// --light / --maxdim / --no-mce are sugar; explicit --set wins.
+		// --light / --maxdim / --no-mce / --reader / --crop-main are
+		// sugar; explicit --set / settings.json values win.
 		if *light && s.OCRLightMode == nil {
 			s.OCRLightMode = boolPtr(true)
 		}
@@ -316,6 +357,19 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 		}
 		if *noMCE && !s.MCEExplicit {
 			s.MCEEnabled, s.MCEExplicit = false, true
+		}
+		if *readerFmt != "" {
+			f, err := settings.NormalizeReaderFormat(*readerFmt)
+			if err != nil {
+				return nil, fmt.Errorf("--reader-format: %v", err)
+			}
+			s.ReaderFormat = f
+		}
+		if *reader && s.ReaderFormat == "" {
+			s.ReaderFormat = "markdown"
+		}
+		if *cropMain {
+			s.CropMain = true
 		}
 		return s, nil
 	}
@@ -367,6 +421,7 @@ func parsePipeline(cmd string, args []string, common commonOpts) (runOptions, *s
 	outdir := fs.String("o", "", "output directory (default ./results)")
 	noHTML := fs.Bool("no-html", false, "write JSON only, no HTML reports")
 	debug := fs.Bool("debug", false, "library debug mode")
+	print := fs.Bool("print", false, "print the reader view to stdout")
 
 	setPairs, filtered := extractSetPairs(args)
 	build := addSettingsFlags(fs)
@@ -380,14 +435,21 @@ func parsePipeline(cmd string, args []string, common commonOpts) (runOptions, *s
 	if err := s.ParseSetList(setPairs); err != nil {
 		return runOptions{}, nil, err
 	}
+	// The demo showcases the reader view by default (markdown).
+	if cmd == "demo" && s.ReaderFormat == "" {
+		s.ReaderFormat = "markdown"
+	}
 	// pull the per-run values back out of the folded settings
 	opts := runOptions{
-		sources: fs.Args(),
-		outdir:  *outdir,
-		light:   s.OCRLightMode != nil && *s.OCRLightMode,
-		mce:     s.MCEEnabled,
-		html:    !*noHTML,
-		maxdim:  s.MaxImageDim,
+		sources:     fs.Args(),
+		outdir:      *outdir,
+		light:       s.OCRLightMode != nil && *s.OCRLightMode,
+		mce:         s.MCEEnabled,
+		html:        !*noHTML,
+		maxdim:      s.MaxImageDim,
+		readerFmt:   s.ReaderFormat,
+		cropMain:    s.CropMain,
+		printReader: *print,
 	}
 	if s.DebugMode != nil {
 		// engine.Options.DebugMode folds this in New()
@@ -404,6 +466,35 @@ func parsePipeline(cmd string, args []string, common commonOpts) (runOptions, *s
 		return opts, s, fmt.Errorf("run needs at least one input file or URL")
 	}
 	return opts, s, nil
+}
+
+// cmdInit implements `screenai init [FILE]`: write a fully documented
+// settings.json. The template contains every key with its stock
+// default, so loading it is a behavioural no-op — users delete what
+// they do not want and edit the rest.
+func cmdInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	force := fs.Bool("force", false, "overwrite an existing file")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	path := "settings.json"
+	if fs.NArg() > 0 {
+		path = fs.Arg(0)
+	}
+	if !*force {
+		if _, err := os.Stat(path); err == nil {
+			fmt.Fprintf(os.Stderr, "screenai: %s already exists — use --force to overwrite\n", path)
+			return 1
+		}
+	}
+	if err := os.WriteFile(path, []byte(settings.Template()), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "screenai: %v\n", err)
+		return 1
+	}
+	fmt.Printf("wrote %s — every key at its stock default; delete what you don't need\n", path)
+	fmt.Printf("auto-loaded on the next run (or point $SCREENAI_SETTINGS at it)\n")
+	return 0
 }
 
 func cmdInfo(eng *engine.Engine) int {
@@ -464,6 +555,8 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 		MCE:           opts.mce,
 		Languages:     s.Languages,
 		MinConfidence: s.MinConfidence,
+		ReaderFormat:  opts.readerFmt,
+		CropMain:      opts.cropMain,
 		Effective:     s.Effective(),
 	}
 
@@ -505,6 +598,18 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 			fmt.Printf("      filter: %d/%d lines kept (langs %s, min-conf %g)\n",
 				res.Filter.LinesKept, res.Filter.LinesBefore,
 				strings.Join(res.Filter.Languages, ","), res.Filter.MinConfidence)
+		}
+		if rep.MCE != nil && rep.MCE.Stats != nil {
+			st := rep.MCE.Stats
+			fmt.Printf("      main content: %d/%d nodes (%.1f%% clutter), %d words, ~%ds read\n",
+				st.SelectedNodes, st.TotalNodes, st.ClutterPct, st.ReaderWords, st.ReadingSec)
+		}
+		if len(rep.MainPNG) > 0 {
+			fmt.Printf("      crop: %s.main.png (%d bytes)\n",
+				filepath.Join(opts.outdir, report.Stem(inp.Name)), len(rep.MainPNG))
+		}
+		if opts.printReader && rep.ReaderView != "" {
+			fmt.Printf("--- reader view (%s) ---\n%s", rep.ReaderFormat, rep.ReaderView)
 		}
 	}
 

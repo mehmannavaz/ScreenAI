@@ -89,6 +89,12 @@ type ReaderView struct {
 	Text      string
 }
 
+// OutlineView is one outline (in-content heading) row.
+type OutlineView struct {
+	Level int
+	Text  string
+}
+
 // NodeView is one row of the MCE node table.
 type NodeView struct {
 	IsMain bool
@@ -109,6 +115,11 @@ type MCEView struct {
 	MainProto   string
 	Reader      []ReaderView
 	ReaderMeta  string
+	Outline     []OutlineView
+	ReaderWords int
+	ReadingSec  int
+	ClutterPct  string
+	CropBox     string
 	Nodes       []NodeView
 }
 
@@ -259,6 +270,17 @@ func buildMCEView(view *MCEView, mce *pipeline.MCE) {
 		view.MainProto = fmt.Sprintf("%d", *mce.MainNodeProtoID)
 	}
 	view.ReaderMeta = mce.MainText
+	for _, o := range mce.Outline {
+		view.Outline = append(view.Outline, OutlineView{Level: o.Level, Text: o.Text})
+	}
+	if mce.Stats != nil {
+		view.ReaderWords = mce.Stats.ReaderWords
+		view.ReadingSec = mce.Stats.ReadingSec
+		view.ClutterPct = fmt.Sprintf("%.1f%%", mce.Stats.ClutterPct)
+	}
+	if mce.CropBox != nil {
+		view.CropBox = fmt.Sprintf("%d,%d,%d,%d", mce.CropBox[0], mce.CropBox[1], mce.CropBox[2], mce.CropBox[3])
+	}
 
 	selected := map[int]bool{}
 	for _, ax := range mce.ContentAXNodeIDs {
@@ -266,7 +288,7 @@ func buildMCEView(view *MCEView, mce *pipeline.MCE) {
 	}
 	for _, part := range mce.Reader {
 		view.Reader = append(view.Reader, ReaderView{
-			IsHeading: part.Level != nil,
+			IsHeading: part.Role == "heading",
 			Text:      part.Text,
 		})
 	}
@@ -310,8 +332,9 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// WriteResults writes the .ocr.json / .mce.json (+ .report.html) files
-// for one result and returns the index entry.
+// WriteResults writes the .ocr.json / .mce.json (+ .report.html,
+// + .reader.md and .main.png when requested) files for one result
+// and returns the index entry.
 func WriteResults(outdir string, res *pipeline.Result, rep *pipeline.ReportData, name string, writeHTML bool) (Entry, error) {
 	stem := Stem(name)
 	if err := os.MkdirAll(outdir, 0o755); err != nil {
@@ -338,6 +361,19 @@ func WriteResults(outdir string, res *pipeline.Result, rep *pipeline.ReportData,
 	}
 	if res.MCE != nil {
 		if err := writeJSON(stem+".mce.json", res.MCE); err != nil {
+			return entry, err
+		}
+	}
+	// Reader-view export (settings key reader.format / --reader).
+	if rep.ReaderView != "" && rep.ReaderFormat != "" {
+		ext := pipeline.ReaderExtension(rep.ReaderFormat)
+		if err := os.WriteFile(filepath.Join(outdir, stem+".reader."+ext), []byte(rep.ReaderView), 0o644); err != nil {
+			return entry, err
+		}
+	}
+	// Main-content crop (settings key mce.crop_main / --crop-main).
+	if len(rep.MainPNG) > 0 {
+		if err := os.WriteFile(filepath.Join(outdir, stem+".main.png"), rep.MainPNG, 0o644); err != nil {
 			return entry, err
 		}
 	}

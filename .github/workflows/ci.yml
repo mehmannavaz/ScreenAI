@@ -57,13 +57,48 @@ jobs:
       - name: Settings e2e (threshold + scripts + filters via CLI)
         run: |
           ./screenai demo --component component -o out-default
+          test -f out-default/example_1_news_article.reader.md   # demo ships the reader view by default
           ./screenai demo --component component --set mce.threshold_non_essential=0.99 -o out-strict
           ./screenai demo --component component --set ocr.scripts=en --langs en -o out-scripted
           test -f out-default/example_1_news_article.mce.json
           test -f out-strict/example_1_news_article.mce.json
           test -f out-scripted/example_1_news_article.mce.json
 
-      - name: Serve e2e (settings at startup, filters per request)
+      - name: MCE features e2e (reader export, crop, outline, stats, selected)
+        run: |
+          ./screenai run --component component --reader --crop-main \
+            out-default/examples/example_1_news_article.png -o out-reader
+          test -f out-reader/example_1_news_article.reader.md
+          test -f out-reader/example_1_news_article.main.png
+          grep -q '"selected"' out-reader/example_1_news_article.mce.json
+          grep -q '"stats"' out-reader/example_1_news_article.mce.json
+          grep -q '"crop_box"' out-reader/example_1_news_article.mce.json
+          ./screenai run --component component --reader-format text \
+            out-default/examples/example_3_article.html -o out-reader-text
+          test -f out-reader-text/example_3_article.reader.txt
+          grep -q '"outline"' out-reader-text/example_3_article.mce.json
+
+      - name: settings.json e2e (init, auto-load, nested format, precedence)
+        run: |
+          ./screenai init my-template.json
+          jq -e . my-template.json > /dev/null            # the template is valid JSON
+          jq -e '._readme | length > 0' my-template.json > /dev/null
+          printf '{"mce": {"threshold_non_essential": 0.99}, "reader": {"format": "markdown"}}\n' > settings.json
+          # NOTE: redirect to a file, then grep — piping into `grep -q`
+          # SIGPIPEs the engine before it writes its results.
+          ./screenai run --component component \
+            out-default/examples/example_1_news_article.png -o out-auto > run-auto.log 2>&1
+          grep -q 'settings: loaded settings.json' run-auto.log
+          test "$(jq '.content_axnode_ids | length' out-auto/example_1_news_article.mce.json)" = "15"
+          test -f out-auto/example_1_news_article.reader.md
+          # --set must override the auto-loaded file
+          ./screenai run --component component --set mce.threshold_non_essential=0.65 \
+            out-default/examples/example_1_news_article.png -o out-over > run-over.log 2>&1
+          grep -q 'settings: loaded settings.json' run-over.log
+          test "$(jq '.content_axnode_ids | length' out-over/example_1_news_article.mce.json)" = "8"
+          rm settings.json my-template.json
+
+      - name: Serve e2e (settings at startup, filters/reader/crop per request)
         run: |
           ./screenai serve --port 8778 --component component --set mce.threshold_non_essential=0.99 &
           SERVER_PID=$!
@@ -71,4 +106,10 @@ jobs:
           curl -s http://127.0.0.1:8778/api/settings | grep -q 'mce.threshold_non_essential=0.99'
           curl -s --data-binary @out-default/examples/example_1_news_article.png \
             'http://127.0.0.1:8778/api/process?name=news.png&langs=en&min_conf=0.5' | grep -q '"filter"'
+          curl -s --data-binary @out-default/examples/example_1_news_article.png \
+            'http://127.0.0.1:8778/api/process?name=news.png&reader=markdown&crop=1' \
+            | grep -q '"reader_view_format": "markdown"'
+          curl -s --data-binary @out-default/examples/example_1_news_article.png \
+            'http://127.0.0.1:8778/api/process?name=news.png&reader=markdown&crop=1' \
+            | grep -q '"main_png_base64"'
           kill $SERVER_PID

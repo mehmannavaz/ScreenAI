@@ -36,7 +36,9 @@ then:
 $ ./screenai download              # fetch the component from Google (~124 MB, resumable)
 $ ./screenai info                  # engine status
 $ ./screenai run photo.png page.html notes.txt -o results
+$ ./screenai run --reader --crop-main article.png   # reader view + main-content crop
 $ ./screenai demo                   # run the bundled examples
+$ ./screenai init                   # write a documented settings.json
 $ ./screenai serve --port 8778      # expose the engine as an HTTP API
 $ ./screenai settings               # every available setting, with defaults
 $ ./screenai selftest               # verify codecs (and the engine if present)
@@ -44,7 +46,33 @@ $ ./screenai selftest               # verify codecs (and the engine if present)
 
 Each run writes `{name}.ocr.json`, `{name}.mce.json`, a self-contained
 `{name}.report.html` (image with confidence-colored OCR overlay, reader
-view, MAIN badges), and an `index.html` hub.
+view, outline, stats, MAIN badges), and an `index.html` hub. With
+`--reader` it also writes `{name}.reader.md` (or `.txt` / `.html`), and
+with `--crop-main` the `{name}.main.png` crop of the main-content region.
+
+## MCE abilities beyond the ids
+
+`ExtractMainContent` returns selected node ids, but the wrapper turns
+that selection into a full main-content feature set — all derived from
+what the Screen2x model actually picked, never invented:
+
+- **Reader view** (`--reader`, setting `reader.format`): the distilled
+  main content, exported as **markdown** (headings keep their h1–h6
+  levels), **text** (underlined headings) or **html** (`<article>` with
+  semantic tags). `--print` dumps it to stdout; the server returns it
+  as `reader_view`.
+- **Outline**: every heading inside the main content, in reading order
+  (`outline` in the MCE JSON; also shown in the HTML report).
+- **Stats** (`stats` in the MCE JSON): selected/total nodes, kept
+  ratio, clutter dropped %, reader words, chars, and an estimated
+  reading time (200 wpm).
+- **Per-node selection**: every node in the MCE JSON now carries
+  `selected: true/false`.
+- **Main-content crop** (`--crop-main`, setting `mce.crop_main`):
+  images get `{name}.main.png` — the union bounding box of the
+  selection cropped pixel-exact from the image the OCR saw (4px
+  padding, clamped); the server returns it as `main_png_base64`, and
+  the exact box is always in `crop_box`.
 
 ## Settings — every knob, extracted from the binary itself
 
@@ -76,19 +104,51 @@ the real binary (run `screenai selftest` to re-prove it on your machine):
 | `mce.threshold_main` | `0.0` | pbtxt | main-content class threshold |
 | `mce.num_threads` | `1` | pbtxt | Screen2x TFLite inference threads |
 | `mce.chrome_post_process` | `true` | pbtxt | Chrome-specific post-processing |
+| `mce.crop_main` | `false` | wrapper | crop the main-content region out of the image → `<stem>.main.png` + `crop_box` (images only) |
+| `reader.format` | `none` | wrapper | export the reader view: `text` \| `markdown` \| `html` → `<stem>.reader.*` |
 
-Apply them in three ways:
+### settings.json
+
+`./settings.json` (or the file `$SCREENAI_SETTINGS` points at) is
+**auto-loaded** whenever it exists — `screenai init` writes a fully
+documented one (`settings.example.json` in this repo is the same file).
+Both flat and nested formats work, `_`-prefixed keys are documentation,
+and empty values mean "unset":
+
+```json
+{
+  "mce": {
+    "threshold_non_essential": 0.9,
+    "crop_main": true
+  },
+  "ocr": {
+    "languages": ["en"],
+    "min_confidence": 0.6
+  },
+  "reader": { "format": "markdown" }
+}
+```
+
+Precedence, lowest to highest: defaults → auto-loaded `settings.json`
+→ `--settings FILE` → `--set k=v` (and flag sugar). A file that fails
+  to parse stops the run — a typo'd settings.json must never silently
+  run the engine with half the intended overrides. `screenai settings
+  --json` prints the machine-readable reference plus the template.
+
+Apply settings in three ways:
 
 ```console
 # 1. individual flags (repeatable)
 $ screenai run --set mce.threshold_non_essential=0.9 --set ocr.scripts=und,Jpan,Kore,Hani photo.png
 
 # 2. quick sugar for the common ones
-$ screenai run --langs en --min-conf 0.8 scan.png
+$ screenai run --langs en --min-conf 0.8 --reader --crop-main scan.png
 
 # 3. a JSON file
-$ screenai run --settings my.json photo.png
+$ screenai run --settings my.json photo.png   # or ./settings.json, auto-loaded
 ```
+
+`my.json` may use the flat form too — both are the same file format:
 
 ```json
 {
@@ -138,18 +198,20 @@ the library requests through the VFS.
 | `GET /` | human-readable status page |
 | `GET /api/info` | engine info (version, max image dimension, light mode) |
 | `GET /api/settings` | every setting with defaults + the effective overrides |
-| `POST /api/process?name=file.png&light=0\|1&maxdim=px&mce=0\|1&langs=en,ja&min_conf=0.8` | the whole pipeline; the request body is the raw file bytes; the response is the same JSON the CLI writes, plus a base64 PNG preview of exactly what OCR saw |
+| `POST /api/process?name=file.png&light=0\|1&maxdim=px&mce=0\|1&langs=en,ja&min_conf=0.8&reader=markdown\|text\|html&crop=0\|1` | the whole pipeline; the request body is the raw file bytes; the response is the same JSON the CLI writes, plus a base64 PNG preview of exactly what OCR saw, the `reader_view` export, and — with `crop=1` — `main_png_base64` |
 | `GET /api/sample` | a bundled example image for quick tests |
 
 ```console
-$ curl -s --data-binary @photo.png 'http://127.0.0.1:8778/api/process?name=photo.png' | jq '.ocr.lines | length'
+$ curl -s --data-binary @photo.png 'http://127.0.0.1:8778/api/process?name=photo.png&reader=markdown&crop=1' \
+    | jq '{lines: (.ocr.lines|length), reader: .reader_view[0:80], crop: (.main_png_base64|length)}'
 ```
 
 Engine-level settings are fixed while the server runs; start it with
-`--set` / `--settings` (the effective values are printed at startup and
-echoed by `/api/settings`). The language / confidence filters are
-per-request query params. CORS is open, so browser apps can talk to it
-directly.
+`--set` / `--settings` (a `settings.json` in the server's working
+directory is auto-loaded too; the effective values are printed at
+startup and echoed by `/api/settings`). The language / confidence
+filters, the reader export, and the crop are per-request query params.
+CORS is open, so browser apps can talk to it directly.
 
 ## Building from source
 
@@ -176,11 +238,11 @@ internal/engine    dlopen/LoadLibrary bridge, SkBitmap ABI, model-file callbacks
 internal/pb        protobuf wire codec (VisualAnnotation decode, ViewHierarchy encode)
 internal/pagetree  page trees: OCR/HTML/JSON/text → the Screen2x input format
 internal/imaging   format sniffing, decoders (TGA/PPM custom), box downscale
-internal/pipeline  input classification + the OCR/MCE pipelines + post-filters
+internal/pipeline  input classification + the OCR/MCE pipelines + post-filters + reader-view rendering + main-content crop
 internal/report    self-contained HTML reports + index
 internal/server    the HTTP API
 internal/componentdl  parallel resumable component download + CRX3 extraction
-internal/settings  the deep settings system: key registry + config rewriters (pbtxt, binarypb, script registry, detection config)
+internal/settings  the deep settings system: key registry + config rewriters (pbtxt, binarypb, script registry, detection config) + settings.json (nested/flat, auto-discovery, template)
 internal/selftest  codec/golden checks + settings verification, shipped inside the binary
 internal/cli       command line interface
 examples/          demo inputs (embedded into the binary)
@@ -207,9 +269,11 @@ examples/          demo inputs (embedded into the binary)
 $ go test ./...          # hermetic unit tests (no component needed)
 $ ./screenai selftest     # same checks inside the shipped binary,
                           # plus a live engine smoke test, real-file
-                          # settings patcher checks, and a live A/B
+                          # settings patcher checks, a live A/B
                           # proof that threshold overrides change the
-                          # model's actual selection
+                          # model's actual selection, settings.json
+                          # template/nested-format checks, reader-view
+                          # rendering, and the main-content crop
 ```
 
 The ViewHierarchy encoder is verified byte-for-byte against golden bytes

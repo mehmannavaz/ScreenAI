@@ -114,6 +114,18 @@ type Settings struct {
 	MCENumThreads            *int     // stock 1
 	MCEChromePostProcess     *bool    // stock true
 
+	// ---- MCE-derived output options (wrapper-side, per-run) ----
+	// CropMain crops the union box of the selected main-content
+	// nodes out of the image the OCR saw and saves it as
+	// <stem>.main.png (images only). See mce.crop_main.
+	CropMain bool
+
+	// ---- reader-view export (wrapper-side, per-run) ----
+	// ReaderFormat exports the MCE reader view as a file:
+	// "", "none" (off), "text", "markdown" or "html".
+	// See reader.format.
+	ReaderFormat string
+
 	// ---- wrapper-side pre-processing ----
 	MaxImageDim int  // extra pre-OCR downscale cap, 0 = off
 	MCEEnabled  bool // run Screen2x at all
@@ -244,6 +256,19 @@ var Descriptors = []Descriptor{
 		Summary:   "Chrome-specific Screen2x post-processing",
 		Effect:    "Verified accepted; effect depends on the tree shape",
 	},
+	{
+		Key: "mce.crop_main", Type: "bool", Default: "false",
+		Mechanism: MechanismWrapper,
+		Summary:   "Crop the main-content region out of the input image",
+		Effect:    "Images only: writes <stem>.main.png (union box of the selected nodes) and sets crop_box in the MCE JSON",
+	},
+	// Reader view (MCE-derived output)
+	{
+		Key: "reader.format", Type: "string", Default: "none",
+		Mechanism: MechanismWrapper,
+		Summary:   "Export the MCE reader view as text, markdown or html",
+		Effect:    "markdown writes <stem>.reader.md with heading levels from the tree; the reader view is distilled from the Screen2x selection",
+	},
 }
 
 // Lookup returns the descriptor for key (exact match).
@@ -370,6 +395,20 @@ func (s *Settings) Set(key, value string) error {
 		return nil
 	case "mce.chrome_post_process":
 		return setBool(&s.MCEChromePostProcess, key, value)
+	case "mce.crop_main":
+		b, err := parseBool(value)
+		if err != nil {
+			return fmt.Errorf("%s: %v", key, err)
+		}
+		s.CropMain = b
+		return nil
+	case "reader.format":
+		f, err := NormalizeReaderFormat(value)
+		if err != nil {
+			return fmt.Errorf("%s: %v", key, err)
+		}
+		s.ReaderFormat = f
+		return nil
 	}
 	return fmt.Errorf("setting %q is known but not implemented — this is a bug", key)
 }
@@ -443,10 +482,35 @@ func (s *Settings) Effective() []string {
 	if s.MCEChromePostProcess != nil {
 		add("mce.chrome_post_process=%v", *s.MCEChromePostProcess)
 	}
+	if s.CropMain {
+		add("mce.crop_main=true")
+	}
+	if f, err := NormalizeReaderFormat(s.ReaderFormat); err == nil && f != "" && f != "none" {
+		add("reader.format=%s", f)
+	}
 	return out
 }
 
 // --- value parsing helpers ---
+
+// NormalizeReaderFormat maps the accepted spellings of the reader
+// export format to the canonical value. "" and "none" mean off (an
+// empty canonical value is returned for "").
+func NormalizeReaderFormat(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return "", nil
+	case "none", "off":
+		return "none", nil
+	case "text", "txt":
+		return "text", nil
+	case "md", "markdown":
+		return "markdown", nil
+	case "html", "htm":
+		return "html", nil
+	}
+	return "", fmt.Errorf("want text|markdown|html|none, got %q", v)
+}
 
 func setBool(dst **bool, key, value string) error {
 	b, err := parseBool(value)

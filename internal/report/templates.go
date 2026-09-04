@@ -64,7 +64,9 @@ var pageShell = `<!doctype html>
 <footer>Produced by <b>ScreenAI</b> — Google's genuine closed-source Screen AI component (libchromescreenai.so / chrome_screen_ai.dll, id mfhmdacoffpmifoibamicehhklffanao) through its public C API. No substitute engines are involved.</footer>
 </div></body></html>`
 
-var reportTemplate = template.Must(template.New("page").Parse(
+var reportTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
+	"mul": func(a, b int) int { return a * b },
+}).Parse(
 	`{{define "body"}}
 <h1>{{.Title}}</h1>
 <p class="sub">{{.Subtitle}}</p>
@@ -111,6 +113,8 @@ The Screen2x model did not classify any node of this input as main content.</div
 
 <div class="stats">
   <div class="stat"><div class="k">selected nodes</div><div class="v">{{.MCE.Selected}} <small>/ {{.MCE.Total}}</small></div></div>
+  <div class="stat"><div class="k">clutter dropped</div><div class="v">{{if .MCE.ClutterPct}}{{.MCE.ClutterPct}}{{else}}&mdash;{{end}}</div></div>
+  <div class="stat"><div class="k">reader words</div><div class="v">{{if .MCE.ReaderWords}}{{.MCE.ReaderWords}} <small>&middot; ~{{.MCE.ReadingSec}}s</small>{{else}}&mdash;{{end}}</div></div>
   <div class="stat"><div class="k">main node role</div><div class="v">{{if .MCE.MainRole}}{{.MCE.MainRole}}{{else}}&mdash;{{end}}</div></div>
   <div class="stat"><div class="k">model</div><div class="v" style="font-size:13px">screen2x Chrome a11y</div></div>
 </div>
@@ -120,6 +124,13 @@ The Screen2x model did not classify any node of this input as main content.</div
 <div class="reader" style="margin-top:12px">
 {{if .MCE.ReaderMeta}}<div class="meta">{{.MCE.ReaderMeta}}</div>{{end}}
 {{range .MCE.Reader}}{{if .IsHeading}}<h3>{{.Text}}</h3>{{else}}<p>{{.Text}}</p>{{end}}{{end}}
+</div></div>
+{{end}}
+
+{{if .MCE.Outline}}
+<div class="card"><b>Outline</b> — headings inside the main content
+<div style="margin-top:10px">
+{{range .MCE.Outline}}<div style="padding-left:{{mul .Level 14}}px"><span class="mono" style="color:#8ab4f8">h{{.Level}}</span> {{.Text}}</div>{{end}}
 </div></div>
 {{end}}
 

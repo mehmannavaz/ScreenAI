@@ -58,6 +58,10 @@ func Run(componentDir string) []Result {
 	check("tree-flatten-invariants", testFlattenInvariants)
 	check("tree-fromhtml", testFromHTML)
 	check("classify-sniffing", testClassify)
+	check("settings-template", testSettingsTemplate)
+	check("settings-json-nested", testSettingsJSONNested)
+	check("reader-render", testReaderRender)
+	check("mce-crop", testCropMainContent)
 	if _, err := engine.Locate(componentDir); err == nil {
 		check("engine-smoke", func() error { return engineSmoke(componentDir) })
 		check("settings-patchers", func() error { return settingsSmoke(componentDir) })
@@ -65,6 +69,153 @@ func Run(componentDir string) []Result {
 		fmt.Println("note: component not found — skipping the live engine smoke test")
 	}
 	return results
+}
+
+// testSettingsTemplate verifies the generated settings.json template
+// is valid JSON the loader accepts, that '_' documentation keys are
+// ignored, and that its stock values are behavioural no-ops.
+func testSettingsTemplate() error {
+	dir, err := os.MkdirTemp("", "screenai-tpl")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte(settings.Template()), 0o644); err != nil {
+		return err
+	}
+	s := settings.Default()
+	if err := settings.LoadJSONFile(path, s); err != nil {
+		return fmt.Errorf("template does not load: %v", err)
+	}
+	if s.ReaderFormat != "none" && s.ReaderFormat != "" {
+		return fmt.Errorf("template reader.format should be off, got %q", s.ReaderFormat)
+	}
+	if s.CropMain {
+		return fmt.Errorf("template mce.crop_main should be false")
+	}
+	if !s.MCEEnabled {
+		return fmt.Errorf("template mce.enabled should stay true")
+	}
+	return nil
+}
+
+// testSettingsJSONNested verifies the nested JSON format flattens to
+// the same keys as the flat format, and that unknown keys fail.
+func testSettingsJSONNested() error {
+	dir, err := os.MkdirTemp("", "screenai-nested")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	write := func(content string) string {
+		path := filepath.Join(dir, "settings.json")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			panic(err)
+		}
+		return path
+	}
+	// nested form
+	s := settings.Default()
+	if err := settings.LoadJSONFile(write(`{
+                "_doc": "docs are ignored",
+                "mce": {"threshold_non_essential": 0.9, "crop_main": true},
+                "ocr": {"languages": ["en"], "min_confidence": 0.5},
+                "reader": {"format": "text"}
+        }`), s); err != nil {
+		return err
+	}
+	if s.MCEThresholdNonEssential == nil || *s.MCEThresholdNonEssential != 0.9 {
+		return fmt.Errorf("nested mce.threshold_non_essential not applied")
+	}
+	if !s.CropMain {
+		return fmt.Errorf("nested mce.crop_main not applied")
+	}
+	if len(s.Languages) != 1 || s.Languages[0] != "en" {
+		return fmt.Errorf("nested ocr.languages not applied")
+	}
+	if s.MinConfidence != 0.5 {
+		return fmt.Errorf("nested ocr.min_confidence not applied")
+	}
+	if s.ReaderFormat != "text" {
+		return fmt.Errorf("nested reader.format not applied")
+	}
+	// equivalent flat form
+	s2 := settings.Default()
+	if err := settings.LoadJSONFile(write(`{
+                "mce.threshold_non_essential": 0.9, "mce.crop_main": true,
+                "ocr.languages": "en", "ocr.min_confidence": 0.5,
+                "reader.format": "text"
+        }`), s2); err != nil {
+		return err
+	}
+	if (s2.MCEThresholdNonEssential == nil) || (*s2.MCEThresholdNonEssential != *s.MCEThresholdNonEssential) ||
+		s2.CropMain != s.CropMain || s2.MinConfidence != s.MinConfidence ||
+		s2.ReaderFormat != s.ReaderFormat || strings.Join(s2.Languages, ",") != strings.Join(s.Languages, ",") {
+		return fmt.Errorf("flat and nested formats disagree")
+	}
+	// unknown keys must fail
+	s3 := settings.Default()
+	if err := settings.LoadJSONFile(write(`{"mce": {"threshold_typo": 1}}`), s3); err == nil {
+		return fmt.Errorf("unknown nested key did not fail")
+	}
+	return nil
+}
+
+// testReaderRender verifies the three reader-view export formats.
+func testReaderRender() error {
+	two := 2
+	m := &pipeline.MCE{Reader: []pipeline.ReaderPart{
+		{Role: "heading", Level: &two, Text: "Slow Kitchen"},
+		{Role: "paragraph", Text: "Long fermentation is not a fashion."},
+	}}
+	md := pipeline.RenderReaderView(m, "markdown")
+	if !strings.Contains(md, "## Slow Kitchen") || !strings.Contains(md, "Long fermentation is not a fashion.") {
+		return fmt.Errorf("markdown export wrong: %q", md)
+	}
+	txt := pipeline.RenderReaderView(m, "text")
+	if !strings.Contains(txt, "Slow Kitchen\n------------") {
+		return fmt.Errorf("text export wrong: %q", txt)
+	}
+	htm := pipeline.RenderReaderView(m, "html")
+	if !strings.Contains(htm, "<h2>Slow Kitchen</h2>") || !strings.Contains(htm, "<article>") {
+		return fmt.Errorf("html export wrong: %q", htm)
+	}
+	return nil
+}
+
+// testCropMainContent verifies the main-content crop: exact pixels of
+// the union box (plus padding) out of the image the OCR saw.
+func testCropMainContent() error {
+	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			i := img.PixOffset(x, y)
+			img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 0xff, 0, 0, 0xff
+		}
+	}
+	box := [4]int{20, 10, 40, 30} // l, t, r, b
+	png, err := pipeline.CropMainContent(img, &pipeline.MCE{CropBox: &box})
+	if err != nil {
+		return err
+	}
+	dec, _, err := image.Decode(bytes.NewReader(png))
+	if err != nil {
+		return err
+	}
+	// 20..40 x 10..30 (20x20) padded 4px on each side → 28x28
+	w, h := dec.Bounds().Dx(), dec.Bounds().Dy()
+	if w != 28 || h != 28 {
+		return fmt.Errorf("crop size %dx%d, want 28x28", w, h)
+	}
+	r, _, _, _ := dec.At(12, 12).RGBA()
+	if r == 0 {
+		return fmt.Errorf("crop pixels are wrong")
+	}
+	if _, err := pipeline.CropMainContent(img, &pipeline.MCE{}); err == nil {
+		return fmt.Errorf("crop without a selection should fail")
+	}
+	return nil
 }
 
 // PrintAndReport prints the results and returns a non-nil error when

@@ -12,6 +12,10 @@
 //	                                 mce=0|1           (run Screen2x)
 //	                                 langs=en,ja       (language filter)
 //	                                 min_conf=0.8      (confidence filter)
+//	                                 reader=markdown|text|html (reader-view export
+//	                                 in the JSON response, field reader_view)
+//	                                 crop=0|1          (main_png_base64 crop of
+//	                                 the main-content region)
 //	GET  /api/sample           one bundled example image
 //
 // The engine is single-threaded by nature; the whole /api/process
@@ -198,6 +202,20 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 	}
 	minConf := 0.0
 	fmt.Sscanf(q.Get("min_conf"), "%g", &minConf)
+	readerFmt := ""
+	if v := q.Get("reader"); v != "" {
+		f, err := settings.NormalizeReaderFormat(v)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok": false, "error": fmt.Sprintf("reader: %v", err)})
+			return
+		}
+		if f == "" || f == "none" {
+			f = "markdown" // bare reader= means markdown
+		}
+		readerFmt = f
+	}
+	cropMain := q.Get("crop") == "1" || q.Get("crop") == "true"
 
 	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	data, err := readAll(r)
@@ -225,6 +243,7 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 			res, _, perr = pipeline.Process(s, inp, pipeline.Options{
 				Light: light, MaxDim: maxdim, MCE: wantMCE,
 				Languages: langs, MinConfidence: minConf,
+				ReaderFormat: readerFmt, CropMain: cropMain,
 				Effective: eng.Settings().Effective(),
 			})
 			return perr
