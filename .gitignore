@@ -1,0 +1,21 @@
+# binaries and build output
+/bin/
+*.exe
+*.test
+*.out
+
+# the proprietary Google component (downloaded, never committed)
+/component/
+/component_linux/
+/component_windows/
+/component_mac/
+*.crx
+*.crx.part*
+
+# runtime artifacts
+/results/
+/libthreadlogger_shim.so
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: >
+          go build -trimpath
+          -ldflags "-s -w -X github.com/mehmannavaz/ScreenAI/internal/cli.Version=${{ github.ref_name }}"
+          -o screenai-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          ./cmd/screenai
+
+      - name: Smoke test (hermetic selftest)
+        run: go run ./cmd/screenai selftest
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp screenai-${{ matrix.goos }}-${{ matrix.goarch }} LICENSE README.md dist/
+          cd dist && zip -q screenai-${{ matrix.goos }}-${{ matrix.goarch }}.zip *
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "screenai-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}", LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "dist/screenai-${{ matrix.goos }}-${{ matrix.goarch }}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenai-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/screenai-${{ matrix.goos }}-${{ matrix.goarch }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

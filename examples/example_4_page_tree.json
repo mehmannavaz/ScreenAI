@@ -1,0 +1,165 @@
+{
+ "tree_size": [
+  1280,
+  1700
+ ],
+ "root": {
+  "role": "rootWebArea",
+  "text": "",
+  "box": [
+   0,
+   0,
+   1280,
+   1700
+  ],
+  "children": [
+   {
+    "role": "navigation",
+    "text": "Recipes Desserts About",
+    "box": [
+     0,
+     0,
+     1280,
+     64
+    ],
+    "font_size": 14,
+    "children": []
+   },
+   {
+    "role": "banner",
+    "text": "The Slow Kitchen",
+    "box": [
+     0,
+     64,
+     1280,
+     150
+    ],
+    "font_size": 36,
+    "font_weight": 700,
+    "children": []
+   },
+   {
+    "role": "main",
+    "text": "",
+    "box": [
+     120,
+     190,
+     1160,
+     1450
+    ],
+    "children": [
+     {
+      "role": "heading",
+      "text": "Bread that takes all day",
+      "box": [
+       120,
+       190,
+       900,
+       260
+      ],
+      "font_size": 30,
+      "font_weight": 700,
+      "level": 1,
+      "children": []
+     },
+     {
+      "role": "paragraph",
+      "text": "",
+      "box": [
+       120,
+       280,
+       900,
+       470
+      ],
+      "children": [
+       {
+        "role": "staticText",
+        "text": "Long fermentation is not a fashion; it is a chemistry that trades your calendar for flavour.",
+        "box": [
+         120,
+         280,
+         900,
+         340
+        ],
+        "font_size": 17,
+        "children": []
+       },
+       {
+        "role": "staticText",
+        "text": "A cold overnight proof lets enzymes snip starches into sugars the yeast never could reach.",
+        "box": [
+         120,
+         345,
+         900,
+         405
+        ],
+        "font_size": 17,
+        "children": []
+       }
+      ]
+     },
+     {
+      "role": "paragraph",
+      "text": "",
+      "box": [
+       120,
+       500,
+       900,
+       700
+      ],
+      "children": [
+       {
+        "role": "staticText",
+        "text": "Start the levain Friday night, fold it four times Saturday, and bake Sunday morning while the house still sleeps.",
+        "box": [
+         120,
+         500,
+         900,
+         560
+        ],
+        "font_size": 17,
+        "children": []
+       },
+       {
+        "role": "staticText",
+        "text": "The reward is a crumb that stays moist for days and a crust that sings as it cools.",
+        "box": [
+         120,
+         565,
+         900,
+         625
+        ],
+        "font_size": 17,
+        "children": []
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "complementary",
+    "text": "Ad - Stand mixer sale - 30% off",
+    "box": [
+     940,
+     190,
+     1240,
+     420
+    ],
+    "font_size": 13,
+    "children": []
+   },
+   {
+    "role": "contentinfo",
+    "text": "The Slow Kitchen 2026 Contact",
+    "box": [
+     0,
+     1500,
+     1280,
+     1600
+    ],
+    "font_size": 12,
+    "children": []
+   }
+  ]
+ }
+}

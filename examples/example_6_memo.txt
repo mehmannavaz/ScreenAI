@@ -1,0 +1,13 @@
+Memo: server room cooling
+
+The north rack cluster has run hot since the storage upgrade. Facilities
+will install a second condenser unit this Saturday between 08:00 and 14:00.
+During the window the intake temperature may rise by several degrees.
+
+Action items before Saturday: shut down the batch training jobs, move the
+backup gateway to the south switch, and label the power rails that will
+be disconnected. Anything still running at 07:45 will be terminated.
+
+After the install, collect a week of thermal logs and compare them with
+the baseline captured last month. If the delta stays above two degrees
+Celsius we will revisit the rack layout in the next quarterly review.
