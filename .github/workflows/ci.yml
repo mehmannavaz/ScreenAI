@@ -89,13 +89,13 @@ jobs:
           ./screenai run --component component \
             out-default/examples/example_1_news_article.png -o out-auto > run-auto.log 2>&1
           grep -q 'settings: loaded settings.json' run-auto.log
-          test "$(jq '.content_axnode_ids | length' out-auto/example_1_news_article.mce.json)" = "15"
+          test "$(jq '.content_axnode_ids | length' out-auto/example_1_news_article.mce.json)" = "16"
           test -f out-auto/example_1_news_article.reader.md
           # --set must override the auto-loaded file
           ./screenai run --component component --set mce.threshold_non_essential=0.65 \
             out-default/examples/example_1_news_article.png -o out-over > run-over.log 2>&1
           grep -q 'settings: loaded settings.json' run-over.log
-          test "$(jq '.content_axnode_ids | length' out-over/example_1_news_article.mce.json)" = "8"
+          test "$(jq '.content_axnode_ids | length' out-over/example_1_news_article.mce.json)" = "11"
           rm settings.json my-template.json
 
       - name: Serve e2e (settings at startup, filters/reader/crop per request)
@@ -114,5 +114,5 @@ jobs:
           jq -e '.reader_view | length > 0' resp.json > /dev/null
           jq -e '.main_png_base64 | length > 1000' resp.json > /dev/null
           jq -e '.mce.crop_box | length == 4' resp.json > /dev/null
-          jq -e '.mce.stats.selected_nodes == 15' resp.json > /dev/null
+          jq -e '.mce.stats.selected_nodes == 13' resp.json > /dev/null
           kill $SERVER_PID

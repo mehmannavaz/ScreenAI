@@ -472,9 +472,9 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree, excludeRegions bool) (*M
 	total := len(tree.Nodes)
 	if total > 0 {
 		s := &MCEStats{
-			SelectedNodes:  len(contentIDs),
+			SelectedNodes:  len(finalIDs),
 			TotalNodes:     total,
-			KeptRatio:      float64(len(contentIDs)) / float64(total),
+			KeptRatio:      float64(len(finalIDs)) / float64(total),
 			ReaderWords:    readerWords,
 			ReaderChars:    readerChars,
 			ReadingSec:     (readerWords*60 + ReadingWordsPerMinute - 1) / ReadingWordsPerMinute,
