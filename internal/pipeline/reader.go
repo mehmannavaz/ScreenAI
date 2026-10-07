@@ -20,8 +20,8 @@ const ReadingWordsPerMinute = 200
 // RenderReaderView renders the MCE reader view — the distilled main
 // content — in one of the export formats: "markdown", "text" or
 // "html". Headings keep their levels from the page tree (h1..h6 for
-// HTML inputs; OCR inputs have no heading nodes and export as plain
-// paragraphs).
+// HTML inputs; heading-sized OCR lines for image inputs), list items
+// render as bullets, and everything else as paragraphs.
 func RenderReaderView(m *MCE, format string) string {
 	switch format {
 	case "text", "txt":
@@ -35,62 +35,107 @@ func RenderReaderView(m *MCE, format string) string {
 
 func renderReaderMarkdown(m *MCE) string {
 	var b strings.Builder
+	inList := false
+	closeList := func() {
+		if inList {
+			b.WriteString("\n")
+			inList = false
+		}
+	}
 	for _, part := range m.Reader {
 		text := strings.TrimSpace(part.Text)
 		if text == "" {
 			continue
 		}
-		if part.Role == "heading" {
+		switch part.Role {
+		case "heading":
+			closeList()
 			level := 1
 			if part.Level != nil {
 				level = clamp(*part.Level, 1, 6)
 			}
 			b.WriteString(strings.Repeat("#", level) + " " + oneLine(text) + "\n\n")
-			continue
+		case "listItem":
+			inList = true
+			b.WriteString("- " + text + "\n")
+		default:
+			closeList()
+			b.WriteString(text + "\n\n")
 		}
-		b.WriteString(text + "\n\n")
 	}
+	closeList()
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
 func renderReaderText(m *MCE) string {
 	var b strings.Builder
+	inList := false
+	closeList := func() {
+		if inList {
+			b.WriteString("\n")
+			inList = false
+		}
+	}
 	for _, part := range m.Reader {
 		text := strings.TrimSpace(part.Text)
 		if text == "" {
 			continue
 		}
-		if part.Role == "heading" {
+		switch part.Role {
+		case "heading":
+			closeList()
 			underline := strings.Repeat("-", len(oneLine(text)))
 			if part.Level != nil && *part.Level <= 1 {
 				underline = strings.Repeat("=", len(oneLine(text)))
 			}
 			b.WriteString(oneLine(text) + "\n" + underline + "\n\n")
-			continue
+		case "listItem":
+			inList = true
+			b.WriteString("  * " + text + "\n")
+		default:
+			closeList()
+			b.WriteString(text + "\n\n")
 		}
-		b.WriteString(text + "\n\n")
 	}
+	closeList()
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
 func renderReaderHTML(m *MCE) string {
 	var b strings.Builder
 	b.WriteString("<article>\n")
+	inList := false
+	closeList := func() {
+		if inList {
+			b.WriteString("</ul>\n")
+			inList = false
+		}
+	}
 	for _, part := range m.Reader {
 		text := strings.TrimSpace(part.Text)
 		if text == "" {
 			continue
 		}
-		if part.Role == "heading" {
+		switch part.Role {
+		case "heading":
+			closeList()
 			level := 1
 			if part.Level != nil {
 				level = clamp(*part.Level, 1, 6)
 			}
 			fmt.Fprintf(&b, "<h%d>%s</h%d>\n", level, html.EscapeString(oneLine(text)), level)
-			continue
+		case "listItem":
+			if !inList {
+				b.WriteString("<ul>\n")
+				inList = true
+			}
+			fmt.Fprintf(&b, "<li>%s</li>\n", html.EscapeString(text))
+		default:
+			closeList()
+			fmt.Fprintf(&b, "<p>%s</p>\n", html.EscapeString(text))
 		}
-		fmt.Fprintf(&b, "<p>%s</p>\n", html.EscapeString(text))
 	}
+	closeList()
 	b.WriteString("</article>\n")
 	return b.String()
 }

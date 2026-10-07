@@ -193,6 +193,7 @@ func Template() string {
     "threshold_main": 0,
     "num_threads": 1,
     "chrome_post_process": true,
+    "exclude_regions": true,
     "crop_main": false
   },
   "reader": {
@@ -203,6 +204,15 @@ func Template() string {
     "_doc": "HTML report overlays — highlight on the image what OCR and MCE detected",
     "ocr_boxes": true,
     "mce_boxes": true
+  },
+  "tree": {
+    "_doc": "Semantic page-tree construction — the roles Screen2x sees (heading/link/list), rebuilt from OCR signals",
+    "detect_headings": true,
+    "detect_lists": true,
+    "detect_links": true,
+    "detect_regions": true,
+    "heading_min_ratio": 1.3,
+    "paragraph_gap": 0.75
   }
 }
 `
@@ -221,6 +231,7 @@ func Reference() string {
 		{"MCE (Screen2x main-content model)", "mce."},
 		{"Reader view (main-content export, wrapper side)", "reader."},
 		{"Report (HTML report overlays, wrapper side)", "report."},
+		{"Tree (semantic page-tree construction, wrapper side)", "tree."},
 	} {
 		b.WriteString(group.title + "\n")
 		for _, d := range Descriptors {

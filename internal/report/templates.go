@@ -48,11 +48,19 @@ pre{background:#0d1117;border:1px solid #232a33;border-radius:8px;padding:14px;o
 .legend{color:#9aa0a6;font-size:12.5px;margin:4px 0 0}
 .badge{font-size:10px;font-weight:700;border-radius:3px;padding:1px 6px;letter-spacing:.5px}
 .badge.main{background:#1a3a2a;color:#7ee2a8;border:1px solid #2b5a41}
+.badge.headline{background:#3a2f1a;color:#fdd663;border:1px solid #5a4a1a}
 .badge.off{color:#3c4043}
+.rolechip{font-size:11px;font-weight:600;border-radius:4px;padding:1px 7px;background:#1b2129;border:1px solid #2a3341;color:#c3c7cb;white-space:nowrap}
+.rolechip.heading{color:#fdd663;border-color:#5a4a1a}
+.rolechip.link{color:#8ab4f8;border-color:#2b4160}
+.rolechip.listItem,.rolechip.list{color:#d5a6ff;border-color:#4a3a6a}
+.rolechip.image{color:#7ee2a8;border-color:#2b5a41}
 .reader{background:#15191f;border:1px solid #232a33;border-radius:8px;padding:18px 24px}
 .reader .meta{color:#9aa0a6;font-size:12.5px;border-bottom:1px solid #232a33;padding-bottom:8px;margin-bottom:10px}
 .reader h3{margin:14px 0 4px;font-size:16.5px}
 .reader p{margin:6px 0;color:#d5d9de}
+.reader .li{margin:3px 0 3px 6px;color:#d5d9de}
+.reader .li::before{content:"•  ";color:#8ab4f8}
 .verdict{border-left:4px solid #7ee2a8}
 .verdict .big{font-size:17px;font-weight:600;margin-bottom:4px}
 details{margin:22px 0}
@@ -103,7 +111,7 @@ var reportTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
 {{if .Stage.HasOCR}}<span class="lay-toggle ocr" data-layer="lay-ocr" role="button" tabindex="0">OCR lines ({{.Stage.OCRCount}})</span>{{end}}
 {{if .Stage.HasMCE}}<span class="lay-toggle mce" data-layer="lay-mce" role="button" tabindex="0">Main content ({{.Stage.MCECount}})</span>{{end}}
 </div>
-<p class="legend">box color = OCR confidence (green &ge; .95, blue &ge; .80, yellow &ge; .60, red below) · filled green = Screen2x main content · dashed = main-content region</p>
+<p class="legend">box color = OCR confidence (green &ge; .95, blue &ge; .80, yellow &ge; .60, red below) · green = Screen2x main content · amber = headline content (headings) · dashed = main-content region</p>
 {{else}}
 <p class="legend">the OCR model found no regions in this image</p>
 {{end}}
@@ -156,11 +164,18 @@ The Screen2x model did not classify any node of this input as main content.</div
   <div class="stat"><div class="k">model</div><div class="v" style="font-size:13px">screen2x Chrome a11y</div></div>
 </div>
 
+{{if .MCE.Roles}}
+<div class="stat"><div class="k">selected roles</div><div class="v" style="font-size:13px">{{.MCE.Roles}}</div></div>
+{{end}}
+{{if .MCE.Headlines}}
+<div class="stat"><div class="k">headlines</div><div class="v">{{.MCE.Headlines}}</div></div>
+{{end}}
+
 {{if .MCE.Reader}}
 <div class="card"><b>Reader view</b> — distilled from the selected nodes
 <div class="reader" style="margin-top:12px">
 {{if .MCE.ReaderMeta}}<div class="meta">{{.MCE.ReaderMeta}}</div>{{end}}
-{{range .MCE.Reader}}{{if .IsHeading}}<h3>{{.Text}}</h3>{{else}}<p>{{.Text}}</p>{{end}}{{end}}
+{{range .MCE.Reader}}{{if .IsHeading}}<h3>{{.Text}}</h3>{{else if .IsItem}}<p class="li">{{.Text}}</p>{{else}}<p>{{.Text}}</p>{{end}}{{end}}
 </div></div>
 {{end}}
 
@@ -173,8 +188,8 @@ The Screen2x model did not classify any node of this input as main content.</div
 
 {{if .MCE.Nodes}}
 <div class="card"><b>Nodes</b><table>
-<tr><th></th><th>axnode_id</th><th>role</th><th>box</th><th>text</th></tr>
-{{range .MCE.Nodes}}<tr><td>{{if .IsMain}}<span class="badge main">MAIN</span>{{else}}<span class="badge off">&middot;</span>{{end}}</td><td class="mono">{{.AXNode}}</td><td>{{.Role}}</td><td class="mono">{{.Box}}</td><td>{{.Text}}</td></tr>
+<tr><th>content</th><th>#</th><th>axnode_id</th><th>role</th><th>box</th><th>font</th><th>text</th></tr>
+{{range .MCE.Nodes}}<tr><td>{{if eq .Type "headline"}}<span class="badge headline">HEADLINE</span>{{else if .IsMain}}<span class="badge main">MAIN</span>{{else}}<span class="badge off">&middot;</span>{{end}}</td><td class="mono">{{if .Order}}{{.Order}}{{else}}&mdash;{{end}}</td><td class="mono">{{.AXNode}}</td><td>{{if .RoleNote}}<span class="rolechip {{.Role}}">{{.Role}} <small>{{.RoleNote}}</small></span>{{else}}<span class="rolechip {{.Role}}">{{.Role}}</span>{{end}}</td><td class="mono">{{.Box}}</td><td class="mono">{{if .Font}}{{.Font}}{{else}}&mdash;{{end}}</td><td>{{.Text}}</td></tr>
 {{end}}</table></div>
 {{end}}
 {{end}}

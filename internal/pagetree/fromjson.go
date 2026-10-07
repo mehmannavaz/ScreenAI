@@ -16,8 +16,13 @@ import (
 //	{"lines": [...], "width": w, "height": h}      (this tool's own OCR output)
 //
 // Node fields: role, text, box [l,t,r,b], font_size, font_weight, level,
-// display, children.
-func FromJSON(data []byte) (*PageTree, error) {
+// text_align, display, children.
+//
+// The OCR-output shape re-runs the full semantic tree construction
+// (headings, lists, links, paragraph merging) with opts; link ink
+// detection uses the engine's per-word foreground_rgb when the JSON
+// carries it, and no pixel underline pass (no image available).
+func FromJSON(data []byte, opts TreeOptions) (*PageTree, error) {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("invalid JSON page tree: %w", err)
@@ -35,7 +40,7 @@ func FromJSON(data []byte) (*PageTree, error) {
 				return nil, fmt.Errorf("invalid OCR JSON: %w", err)
 			}
 			a := &pb.Annotation{Lines: ann.Lines, Width: ann.Width, Height: ann.Height}
-			return FromOCR(a, ann.Width, ann.Height), nil
+			return FromOCR(a, nil, ann.Width, ann.Height, opts), nil
 		}
 	}
 

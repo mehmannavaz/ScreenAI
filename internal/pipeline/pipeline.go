@@ -50,6 +50,16 @@ type Options struct {
 	// in the HTML report (settings key report.mce_boxes). nil =
 	// enabled — the default.
 	ReportMCEBoxes *bool
+	// Tree carries the semantic-tree construction knobs (settings
+	// group tree.*): heading/list/link detection and the paragraph
+	// merge tolerance. Richer roles feed the model's chrome_role
+	// input exactly like Chrome's own trees.
+	Tree pagetree.TreeOptions
+	// ExcludeRegions demotes selected nodes inside complementary
+	// (aside) or contentinfo (footer) landmarks — Screen2x sometimes
+	// keeps sidebar/footer text, but it never belongs in a reader
+	// view (settings key mce.exclude_regions, default true).
+	ExcludeRegions bool
 	// Effective is the rendered settings list echoed into results
 	// ("key=value" strings) so every output records how it was made.
 	Effective []string
@@ -65,13 +75,27 @@ type ReaderPart struct {
 
 // MCENode is the JSON view of one tree node in the MCE result.
 type MCENode struct {
-	AXNodeID    int    `json:"axnode_id"`
-	Role        string `json:"role"`
-	Text        string `json:"text"`
-	SubtreeText string `json:"subtree_text"`
-	Box         [4]int `json:"box"`
-	Level       *int   `json:"level"`
-	Selected    bool   `json:"selected"` // part of the main content?
+	AXNodeID    int     `json:"axnode_id"`
+	Role        string  `json:"role"`
+	Text        string  `json:"text"`
+	SubtreeText string  `json:"subtree_text"`
+	Box         [4]int  `json:"box"`
+	Level       *int    `json:"level,omitempty"`
+	FontSize    float64 `json:"font_size,omitempty"`
+	Selected    bool    `json:"selected"` // part of the main content?
+	// ContentType is the derived per-node classification:
+	// "headline" (selected and a heading or inside one), "main"
+	// (selected body content) or "nonessential" (dropped as
+	// clutter). The library's C API returns only the selection ids,
+	// so the headline/main split is derived from the tree roles —
+	// the model itself predicts three classes (CONTENT_NON_ESSENTIAL,
+	// CONTENT_TEXT_HEADLINE, CONTENT_TEXT_MAIN; see
+	// screen2x_config.pbtxt) but does not expose the per-class
+	// scores.
+	ContentType string `json:"content_type"` // headline | main | nonessential
+	// Order is the reading-order position among the selected nodes
+	// (1-based; 0 when not selected).
+	Order int `json:"order"`
 }
 
 // MCEStats summarises what the Screen2x selection kept: how much of
@@ -84,6 +108,12 @@ type MCEStats struct {
 	ReaderWords   int     `json:"reader_words"`
 	ReaderChars   int     `json:"reader_chars"`
 	ReadingSec    int     `json:"reading_seconds"` // at 200 words/minute
+	// Headlines is how many selected nodes are headline content
+	// (headings or text inside headings).
+	Headlines int `json:"headlines"`
+	// SelectedByRole counts the selected nodes per chrome_role —
+	// the role mix of the kept content.
+	SelectedByRole map[string]int `json:"selected_by_role,omitempty"`
 }
 
 // MCE is the result of the Screen2x main-content run.
@@ -104,6 +134,11 @@ type MCE struct {
 	MainAXNodeID    *int   `json:"main_axnode_id,omitempty"`
 	MainRole        string `json:"main_role,omitempty"`
 	MainText        string `json:"main_text,omitempty"`
+	// VetoedAXNodeIDs lists nodes Screen2x selected that the wrapper
+	// demoted because they sit inside complementary/contentinfo
+	// landmarks (mce.exclude_regions). The raw model selection is
+	// always available in content_axnode_ids.
+	VetoedAXNodeIDs []int `json:"vetoed_axnode_ids,omitempty"`
 }
 
 // Result is the JSON structure the HTTP server and the HTML reporter
@@ -211,7 +246,13 @@ func round3(v float64) float64 {
 // ExtractMainContent returns the values of the axnode_id attribute, so
 // they are remapped to proto indices before Chrome's ComputeMainNode
 // (LCA of the first and last selected node) is applied.
-func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
+//
+// excludeRegions (mce.exclude_regions, default true) demotes selected
+// nodes that sit inside complementary (aside) or contentinfo (footer)
+// landmark containers: Screen2x occasionally keeps sidebar ads and
+// copyright strips, but they never belong in a reader view. The raw
+// model selection remains in ContentAXNodeIDs / VetoedAXNodeIDs.
+func RunMCE(s *engine.Session, tree *pagetree.PageTree, excludeRegions bool) (*MCE, error) {
 	t0 := time.Now()
 	contentIDs, err := s.ExtractMainContent(tree.Serialize())
 	if err != nil {
@@ -234,6 +275,38 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		selected[ax] = true
 	}
 
+	// Landmark veto: demote selected nodes inside complementary /
+	// contentinfo containers (see the doc comment).
+	var vetoed []int
+	if excludeRegions {
+		inLandmark := func(n *pagetree.Node) bool {
+			pid := n.ParentID
+			for pid >= 0 && pid < len(tree.Nodes) {
+				switch tree.Nodes[pid].Node.Role {
+				case "complementary", "contentinfo":
+					return true
+				}
+				pid = tree.Nodes[pid].Node.ParentID
+			}
+			return false
+		}
+		for i := range tree.Nodes {
+			node := tree.Nodes[i].Node
+			if selected[node.AXNodeID] && inLandmark(node) {
+				selected[node.AXNodeID] = false
+				vetoed = append(vetoed, node.AXNodeID)
+			}
+		}
+	}
+	// Final selection in tree (reading) order — drives the reader
+	// view, stats, crop box and ComputeMainNode.
+	finalIDs := make([]int, 0, len(protoIDs))
+	for i := range tree.Nodes {
+		if selected[tree.Nodes[i].Node.AXNodeID] {
+			finalIDs = append(finalIDs, i)
+		}
+	}
+
 	res := &MCE{
 		Ran:              true,
 		Elapsed:          round3(elapsed),
@@ -243,16 +316,19 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		NodeCount:        len(tree.Nodes),
 		Reader:           []ReaderPart{},
 		Nodes:            make([]MCENode, 0, len(tree.Nodes)),
+		VetoedAXNodeIDs:  vetoed,
 	}
 
 	// Reader view: top-most selected nodes — skip nodes already inside a
-	// selected ancestor so no text appears twice.
+	// selected ancestor so no text appears twice. Selected list nodes
+	// expand into one part per list item.
 	//
-	// Heading detection: Screen2x usually selects the TEXT nodes, not
-	// the heading containers around them, so a part whose nearest
-	// heading ancestor (self included) is an h1..h6 renders as a
-	// heading of that level. Multiple selected children of the same
-	// heading merge into one part — they are one heading in the source.
+	// Heading detection: headings are first-class roles in the semantic
+	// tree now, but Screen2x may still select the TEXT nodes rather than
+	// the heading containers, so a part whose nearest heading ancestor
+	// (self included) is an h1..h6 renders as a heading of that level.
+	// Multiple selected children of the same heading merge into one
+	// part — they are one heading in the source.
 	headingAncestor := func(start *pagetree.Node) (id, level int, ok bool) {
 		cur := start
 		for cur != nil {
@@ -271,6 +347,18 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		return 0, 0, false
 	}
 	headingPart := map[int]int{} // heading node id → index in res.Reader
+	addPart := func(role string, level *int, text string) {
+		res.Reader = append(res.Reader, ReaderPart{Role: role, Level: level, Text: text})
+	}
+	expandList := func(node *pagetree.Node) {
+		node.Walk(func(n *pagetree.Node) {
+			if n.Role == "listItem" {
+				if text := pagetree.SubtreeText(n); text != "" {
+					addPart("listItem", nil, text)
+				}
+			}
+		})
+	}
 	for i := range tree.Nodes {
 		node := tree.Nodes[i].Node
 		if !selected[node.AXNodeID] {
@@ -289,8 +377,16 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		if inside {
 			continue
 		}
+		if node.Role == "list" {
+			expandList(node)
+			continue
+		}
 		text := pagetree.SubtreeText(node)
 		if text == "" {
+			continue
+		}
+		if node.Role == "listItem" {
+			addPart("listItem", nil, text)
 			continue
 		}
 		if hid, lvl, isHeading := headingAncestor(node); isHeading {
@@ -307,6 +403,10 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 
 	for i := range tree.Nodes {
 		node := tree.Nodes[i].Node
+		fontSize := 0.0
+		if node.FontSize != nil {
+			fontSize = *node.FontSize
+		}
 		res.Nodes = append(res.Nodes, MCENode{
 			AXNodeID:    node.AXNodeID,
 			Role:        node.Role,
@@ -314,8 +414,40 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 			SubtreeText: pagetree.SubtreeText(node),
 			Box:         tree.Nodes[i].BoxPixels,
 			Level:       node.Level,
+			FontSize:    round1(fontSize),
 			Selected:    selected[node.AXNodeID],
 		})
+	}
+
+	// Derived per-node content types and reading order. The model
+	// predicts three classes (non-essential / headline / main) but the
+	// C API exposes only the selection, so headline content is derived
+	// from the heading roles of the semantic tree.
+	headlineAX := map[int]bool{}
+	for i := range tree.Nodes {
+		node := tree.Nodes[i].Node
+		if !selected[node.AXNodeID] {
+			continue
+		}
+		if _, _, isHeading := headingAncestor(node); isHeading {
+			headlineAX[node.AXNodeID] = true
+		}
+	}
+	next := 1
+	for i := range res.Nodes {
+		n := &res.Nodes[i]
+		switch {
+		case !n.Selected:
+			n.ContentType = "nonessential"
+		case headlineAX[n.AXNodeID]:
+			n.ContentType = "headline"
+		default:
+			n.ContentType = "main"
+		}
+		if n.Selected {
+			n.Order = next
+			next++
+		}
 	}
 
 	// Outline: the headings of the reader view, in reading order —
@@ -340,12 +472,23 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 	total := len(tree.Nodes)
 	if total > 0 {
 		s := &MCEStats{
-			SelectedNodes: len(contentIDs),
-			TotalNodes:    total,
-			KeptRatio:     float64(len(contentIDs)) / float64(total),
-			ReaderWords:   readerWords,
-			ReaderChars:   readerChars,
-			ReadingSec:    (readerWords*60 + ReadingWordsPerMinute - 1) / ReadingWordsPerMinute,
+			SelectedNodes:  len(contentIDs),
+			TotalNodes:     total,
+			KeptRatio:      float64(len(contentIDs)) / float64(total),
+			ReaderWords:    readerWords,
+			ReaderChars:    readerChars,
+			ReadingSec:     (readerWords*60 + ReadingWordsPerMinute - 1) / ReadingWordsPerMinute,
+			SelectedByRole: map[string]int{},
+		}
+		for i := range res.Nodes {
+			n := &res.Nodes[i]
+			if !n.Selected {
+				continue
+			}
+			s.SelectedByRole[n.Role]++
+			if n.ContentType == "headline" {
+				s.Headlines++
+			}
 		}
 		s.ClutterPct = round1((1 - s.KeptRatio) * 100)
 		s.KeptRatio = round3(s.KeptRatio)
@@ -354,9 +497,9 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 
 	// Exact union box of the selection, in image pixels — what
 	// mce.crop_main crops out (padded slightly at crop time).
-	if len(protoIDs) > 0 {
+	if len(finalIDs) > 0 {
 		var box *[4]int
-		for _, p := range protoIDs {
+		for _, p := range finalIDs {
 			if p < 0 || p >= len(tree.Nodes) {
 				continue
 			}
@@ -377,8 +520,8 @@ func RunMCE(s *engine.Session, tree *pagetree.PageTree) (*MCE, error) {
 		res.CropBox = box
 	}
 
-	if len(protoIDs) > 0 {
-		mainProto, _ := tree.ComputeMainNode(protoIDs)
+	if len(finalIDs) > 0 {
+		mainProto, _ := tree.ComputeMainNode(finalIDs)
 		node := tree.Nodes[mainProto].Node
 		res.MainNodeProtoID = &mainProto
 		ax := node.AXNodeID
@@ -419,15 +562,15 @@ func round1(v float64) float64 {
 }
 
 // TreeForInput builds the page tree for non-image inputs.
-func TreeForInput(inp *Input) (*pagetree.PageTree, error) {
+func TreeForInput(inp *Input, treeOpts pagetree.TreeOptions) (*pagetree.PageTree, error) {
 	text := string(inp.Data)
 	switch inp.Kind {
 	case KindPage:
 		return pagetree.FromHTML(text, 1280), nil
 	case KindTree:
-		return pagetree.FromJSON(inp.Data)
+		return pagetree.FromJSON(inp.Data, treeOpts)
 	default:
-		return pagetree.FromText(text, 800), nil
+		return pagetree.FromText(text, 800, treeOpts), nil
 	}
 }
 
@@ -477,8 +620,8 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 			}
 
 			if opts.MCE {
-				tree := pagetree.FromOCR(ann, ann.Width, ann.Height)
-				mce, err := RunMCE(s, tree)
+				tree := pagetree.FromOCR(ann, img, ann.Width, ann.Height, opts.Tree)
+				mce, err := RunMCE(s, tree, opts.ExcludeRegions)
 				if err != nil {
 					pipelineErr = err
 				} else {
@@ -501,11 +644,11 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 			}
 		}
 	} else {
-		tree, err := TreeForInput(inp)
+		tree, err := TreeForInput(inp, opts.Tree)
 		if err != nil {
 			pipelineErr = err
 		} else {
-			mce, err := RunMCE(s, tree)
+			mce, err := RunMCE(s, tree, opts.ExcludeRegions)
 			if err != nil {
 				pipelineErr = err
 			} else {
@@ -589,7 +732,11 @@ func Summarize(res *Result) string {
 		if res.MCE.MainRole != "" {
 			role = res.MCE.MainRole
 		}
-		parts = append(parts, fmt.Sprintf("main content: %d/%d nodes (%s)", len(res.MCE.ContentAXNodeIDs), res.MCE.NodeCount, role))
+		n := len(res.MCE.ContentAXNodeIDs)
+		if res.MCE.Stats != nil {
+			n = res.MCE.Stats.SelectedNodes
+		}
+		parts = append(parts, fmt.Sprintf("main content: %d/%d nodes (%s)", n, res.MCE.NodeCount, role))
 	}
 	if len(parts) == 0 {
 		return "no results"

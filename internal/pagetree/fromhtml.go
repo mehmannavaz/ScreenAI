@@ -16,7 +16,7 @@ var roleFor = map[string]string{
 	"h1": "heading", "h2": "heading", "h3": "heading", "h4": "heading",
 	"h5": "heading", "h6": "heading",
 	"p": "paragraph", "a": "link", "button": "button", "img": "image",
-	"ul": "list", "ol": "list", "li": "listItem",
+	"ul": "list", "ol": "list", "li": "listItem", "hr": "separator",
 	"input": "textField", "select": "popUpButton", "textarea": "textField",
 	"table": "table", "thead": "tableHeaderContainer",
 	"tbody": "genericContainer",
@@ -24,10 +24,19 @@ var roleFor = map[string]string{
 	"blockquote": "blockquote", "pre": "pre", "code": "code",
 	"figure": "figure", "figcaption": "caption",
 	"section": "section", "form": "form", "label": "label",
-	"strong": "strong", "em": "emphasis", "small": "small",
+	"strong": "strong", "b": "strong", "em": "emphasis", "i": "emphasis",
+	"small": "small", "mark": "mark", "time": "time",
 	"svg": "image", "canvas": "image", "video": "video",
-	"hgroup": "genericContainer", "time": "time", "mark": "mark",
-	"dl": "list", "dt": "term", "dd": "definition",
+	"hgroup": "genericContainer", "dl": "list", "dt": "term", "dd": "definition",
+}
+
+// inlineSemantic lists inline elements that become their own
+// accessibility nodes (like Chrome's AX trees: paragraph > link >
+// staticText) instead of being folded into the surrounding text.
+// Generic inline wrappers (span, u, sub, ...) are folded.
+var inlineSemantic = map[string]bool{
+	"a": true, "strong": true, "b": true, "em": true, "i": true,
+	"code": true, "mark": true, "small": true, "time": true,
 }
 
 // fontFor estimates the font size (px) per tag.
@@ -140,30 +149,6 @@ func (l *htmlLayouter) inlineText(node *domEl) string {
 	return strings.Join(parts, " ")
 }
 
-// measureText performs greedy word wrap; it returns the wrapped lines.
-func measureText(text string, font, width float64) []string {
-	maxChars := max(4, int(width/(font*0.52)))
-	words := fields(text)
-	var lines []string
-	cur := ""
-	for _, word := range words {
-		trial := word
-		if cur != "" {
-			trial = cur + " " + word
-		}
-		if len([]rune(trial)) <= maxChars || cur == "" {
-			cur = trial
-		} else {
-			lines = append(lines, cur)
-			cur = word
-		}
-	}
-	if cur != "" {
-		lines = append(lines, cur)
-	}
-	return lines
-}
-
 func (l *htmlLayouter) layout(node *domEl, x, y, w, font float64, bold bool, level *int) *Node {
 	tag := node.tag
 	role := roleFor[tag]
@@ -217,44 +202,124 @@ func (l *htmlLayouter) layout(node *domEl, x, y, w, font float64, bold bool, lev
 		return out
 	}
 
-	ownText := ""
 	var blockKids []*domEl
+	// Inline segments: runs of text and inline semantic elements (a,
+	// strong, em, code, ...). Plain segments become staticText nodes;
+	// element segments become link/strong/... nodes wrapping one
+	// staticText child — the structure Chrome's AX trees carry and
+	// Screen2x's chrome_role input expects. Generic inline wrappers
+	// (span, u, sub, ...) fold into the adjacent plain text.
+	type seg struct {
+		el   *domEl // nil = plain text
+		text string
+	}
+	var segs []seg
+	addSeg := func(el *domEl, text string) {
+		if strings.TrimSpace(text) != "" {
+			segs = append(segs, seg{el, text})
+		}
+	}
 	for _, child := range node.children {
 		switch c := child.(type) {
 		case string:
-			if ownText != "" {
-				ownText += " "
-			}
-			ownText += c
+			addSeg(nil, c)
 		case *domEl:
 			switch c.tag {
-			case "script", "style", "head":
+			case "script", "style", "head", "title":
 				continue
 			}
-			if roleFor[c.tag] != "" || indentFor[c.tag] != 0 {
+			if inlineSemantic[c.tag] {
+				addSeg(c, l.inlineText(c))
+			} else if roleFor[c.tag] != "" || indentFor[c.tag] != 0 {
 				blockKids = append(blockKids, c)
 			} else if inner := l.inlineText(c); inner != "" {
-				if ownText != "" {
-					ownText += " "
-				}
-				ownText += inner
+				addSeg(nil, inner)
 			}
 		}
 	}
 
 	cursor := y
-	if strings.TrimSpace(ownText) != "" {
-		lines := measureText(strings.TrimSpace(ownText), font, w)
+	if len(segs) > 0 {
+		// word-wrap across segments; each word remembers its segment
+		// so consecutive same-segment words on a line merge into one
+		// node
+		type word struct {
+			text string
+			seg  int // -1 = plain
+		}
+		var words []word
+		for si, s := range segs {
+			idx := si
+			if s.el == nil {
+				idx = -1
+			}
+			for _, wd := range strings.Fields(s.text) {
+				words = append(words, word{wd, idx})
+			}
+		}
+		maxChars := max(4, int(w/(font*0.52)))
+		type line struct{ words []word }
+		var lines []line
+		var cur []word
+		curLen := 0
+		for _, wd := range words {
+			add := len([]rune(wd.text))
+			if len(cur) > 0 {
+				add++
+			}
+			if curLen+add > maxChars && len(cur) > 0 {
+				lines = append(lines, line{cur})
+				cur, curLen = nil, 0
+				add = len([]rune(wd.text))
+			}
+			cur = append(cur, wd)
+			curLen += add
+		}
+		if len(cur) > 0 {
+			lines = append(lines, line{cur})
+		}
+
 		lineH := font * 1.45
 		for _, ln := range lines {
-			tw := min(w, float64(len([]rune(ln)))*font*0.52)
-			out.Children = append(out.Children, &Node{
-				Role:       "staticText",
-				Text:       ln,
-				Box:        [4]float64{x, cursor, x + max(tw, 8), cursor + lineH},
-				FontSize:   F64(font),
-				FontWeight: out.FontWeight,
-			})
+			i := 0
+			for i < len(ln.words) {
+				segIdx := ln.words[i].seg
+				j := i
+				for j < len(ln.words) && ln.words[j].seg == segIdx {
+					j++
+				}
+				var parts []string
+				for k := i; k < j; k++ {
+					parts = append(parts, ln.words[k].text)
+				}
+				text := strings.Join(parts, " ")
+				tw := min(w, float64(len([]rune(text)))*font*0.52)
+				box := [4]float64{x, cursor, x + max(tw, 8), cursor + lineH}
+				if segIdx < 0 {
+					out.Children = append(out.Children, &Node{
+						Role:       "staticText",
+						Text:       text,
+						Box:        box,
+						FontSize:   F64(font),
+						FontWeight: out.FontWeight,
+					})
+				} else {
+					role := roleFor[segs[segIdx].el.tag]
+					if role == "" {
+						role = "genericContainer"
+					}
+					inline := &Node{Role: role, Box: box, FontSize: F64(font), FontWeight: out.FontWeight}
+					inline.Children = append(inline.Children, &Node{
+						Role:       "staticText",
+						Text:       text,
+						Box:        box,
+						FontSize:   F64(font),
+						FontWeight: out.FontWeight,
+					})
+					out.Children = append(out.Children, inline)
+				}
+				i = j
+			}
 			cursor += lineH
 		}
 	}

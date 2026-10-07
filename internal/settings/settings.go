@@ -49,6 +49,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/mehmannavaz/ScreenAI/internal/pagetree"
 )
 
 // Mechanism describes how a setting reaches the closed-source library.
@@ -119,6 +121,10 @@ type Settings struct {
 	// nodes out of the image the OCR saw and saves it as
 	// <stem>.main.png (images only). See mce.crop_main.
 	CropMain bool
+	// ExcludeRegions demotes Screen2x selections inside complementary
+	// (aside) / contentinfo (footer) landmarks. nil = default true.
+	// See mce.exclude_regions.
+	ExcludeRegions *bool
 
 	// ---- reader-view export (wrapper-side, per-run) ----
 	// ReaderFormat exports the MCE reader view as a file:
@@ -133,6 +139,19 @@ type Settings struct {
 	// report.mce_boxes.
 	ReportOCRBoxes *bool
 	ReportMCEBoxes *bool
+
+	// ---- semantic tree construction (wrapper-side, per-run) ----
+	// The tree.* knobs control how much structure the wrapper infers
+	// from the OCR output before Screen2x sees it. Chrome's own trees
+	// always carry heading/link/list roles, and the model has a
+	// dedicated categorical chrome_role input — so richer roles mean
+	// better main-content decisions. nil = stock defaults.
+	TreeDetectHeadings  *bool    // tree.detect_headings
+	TreeDetectLists     *bool    // tree.detect_lists
+	TreeDetectLinks     *bool    // tree.detect_links
+	TreeDetectRegions   *bool    // tree.detect_regions
+	TreeHeadingMinRatio *float64 // tree.heading_min_ratio
+	TreeParagraphGap    *float64 // tree.paragraph_gap
 
 	// ---- wrapper-side pre-processing ----
 	MaxImageDim int  // extra pre-OCR downscale cap, 0 = off
@@ -265,6 +284,12 @@ var Descriptors = []Descriptor{
 		Effect:    "Verified accepted; effect depends on the tree shape",
 	},
 	{
+		Key: "mce.exclude_regions", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Demote selections inside aside/footer landmarks (complementary, contentinfo)",
+		Effect:    "Keeps sidebar ads and copyright strips out of the reader view; the raw model selection stays in content_axnode_ids / vetoed_axnode_ids",
+	},
+	{
 		Key: "mce.crop_main", Type: "bool", Default: "false",
 		Mechanism: MechanismWrapper,
 		Summary:   "Crop the main-content region out of the input image",
@@ -289,6 +314,43 @@ var Descriptors = []Descriptor{
 		Mechanism: MechanismWrapper,
 		Summary:   "Highlight what MCE found: Screen2x main-content boxes over the image",
 		Effect:    "false omits the green main-content overlay layer and the dashed region box; --crop-main still works",
+	},
+	// Semantic tree construction
+	{
+		Key: "tree.detect_headings", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Mark clearly larger OCR lines as role heading with a hierarchical_level",
+		Effect:    "Feeds the Screen2x chrome_role input like Chrome's trees; the reader view and outline gain headings on image inputs",
+	},
+	{
+		Key: "tree.detect_lists", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Group bullet/numbered lines and same-row menu runs into list/listItem nodes",
+		Effect:    "Nav bars and bullet lists appear as lists; list items render as bullets in the reader view",
+	},
+	{
+		Key: "tree.detect_links", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Mark link-inked lines (engine foreground_rgb) or underlined lines as role link",
+		Effect:    "Uses the engine's own per-word ink colour plus a pixel underline pass; blue nav/body links become link nodes",
+	},
+	{
+		Key: "tree.detect_regions", Type: "bool", Default: "true",
+		Mechanism: MechanismWrapper,
+		Summary:   "Wrap side columns as complementary (aside) and the trailing footer as contentinfo",
+		Effect:    "Landmark roles are classic clutter signals: on the news example the sidebar ad and copyright line stay out of the reader view",
+	},
+	{
+		Key: "tree.heading_min_ratio", Type: "float", Default: "1.3",
+		Mechanism: MechanismWrapper,
+		Summary:   "Height ratio over body text at which a line becomes a heading",
+		Effect:    "1.2 is more eager (bold sub-headers become headings); 1.6 only clear display sizes",
+	},
+	{
+		Key: "tree.paragraph_gap", Type: "float", Default: "0.75",
+		Mechanism: MechanismWrapper,
+		Summary:   "Max vertical gap (× body line height) that still merges lines into one paragraph",
+		Effect:    "Higher merges more aggressively (multi-block paragraphs); lower splits strictly per OCR block",
 	},
 }
 
@@ -416,6 +478,8 @@ func (s *Settings) Set(key, value string) error {
 		return nil
 	case "mce.chrome_post_process":
 		return setBool(&s.MCEChromePostProcess, key, value)
+	case "mce.exclude_regions":
+		return setBool(&s.ExcludeRegions, key, value)
 	case "mce.crop_main":
 		b, err := parseBool(value)
 		if err != nil {
@@ -434,6 +498,28 @@ func (s *Settings) Set(key, value string) error {
 		return setBool(&s.ReportOCRBoxes, key, value)
 	case "report.mce_boxes":
 		return setBool(&s.ReportMCEBoxes, key, value)
+	case "tree.detect_headings":
+		return setBool(&s.TreeDetectHeadings, key, value)
+	case "tree.detect_lists":
+		return setBool(&s.TreeDetectLists, key, value)
+	case "tree.detect_links":
+		return setBool(&s.TreeDetectLinks, key, value)
+	case "tree.detect_regions":
+		return setBool(&s.TreeDetectRegions, key, value)
+	case "tree.heading_min_ratio":
+		f, err := parseFloat(key, value, 1.05, 4)
+		if err != nil {
+			return err
+		}
+		s.TreeHeadingMinRatio = f
+		return nil
+	case "tree.paragraph_gap":
+		f, err := parseFloat(key, value, 0, 4)
+		if err != nil {
+			return err
+		}
+		s.TreeParagraphGap = f
+		return nil
 	}
 	return fmt.Errorf("setting %q is known but not implemented — this is a bug", key)
 }
@@ -507,6 +593,9 @@ func (s *Settings) Effective() []string {
 	if s.MCEChromePostProcess != nil {
 		add("mce.chrome_post_process=%v", *s.MCEChromePostProcess)
 	}
+	if s.ExcludeRegions != nil {
+		add("mce.exclude_regions=%v", *s.ExcludeRegions)
+	}
 	if s.CropMain {
 		add("mce.crop_main=true")
 	}
@@ -519,7 +608,53 @@ func (s *Settings) Effective() []string {
 	if s.ReportMCEBoxes != nil {
 		add("report.mce_boxes=%v", *s.ReportMCEBoxes)
 	}
+	if s.TreeDetectHeadings != nil {
+		add("tree.detect_headings=%v", *s.TreeDetectHeadings)
+	}
+	if s.TreeDetectLists != nil {
+		add("tree.detect_lists=%v", *s.TreeDetectLists)
+	}
+	if s.TreeDetectLinks != nil {
+		add("tree.detect_links=%v", *s.TreeDetectLinks)
+	}
+	if s.TreeDetectRegions != nil {
+		add("tree.detect_regions=%v", *s.TreeDetectRegions)
+	}
+	if s.TreeHeadingMinRatio != nil {
+		add("tree.heading_min_ratio=%g", *s.TreeHeadingMinRatio)
+	}
+	if s.TreeParagraphGap != nil {
+		add("tree.paragraph_gap=%g", *s.TreeParagraphGap)
+	}
 	return out
+}
+
+// TreeOptions resolves the tree.* settings into the pagetree
+// construction options, applying stock defaults for unset fields.
+func (s *Settings) TreeOptions() pagetree.TreeOptions {
+	if s == nil {
+		return pagetree.DefaultTreeOptions()
+	}
+	opts := pagetree.DefaultTreeOptions()
+	if s.TreeDetectHeadings != nil {
+		opts.DetectHeadings = *s.TreeDetectHeadings
+	}
+	if s.TreeDetectLists != nil {
+		opts.DetectLists = *s.TreeDetectLists
+	}
+	if s.TreeDetectLinks != nil {
+		opts.DetectLinks = *s.TreeDetectLinks
+	}
+	if s.TreeDetectRegions != nil {
+		opts.DetectRegions = *s.TreeDetectRegions
+	}
+	if s.TreeHeadingMinRatio != nil {
+		opts.HeadingMinRatio = *s.TreeHeadingMinRatio
+	}
+	if s.TreeParagraphGap != nil {
+		opts.ParagraphGap = *s.TreeParagraphGap
+	}
+	return opts
 }
 
 // --- value parsing helpers ---

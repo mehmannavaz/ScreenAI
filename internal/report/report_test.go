@@ -34,7 +34,7 @@ func testReportData(ocrOn, mceOn bool) *pipeline.ReportData {
 			Nodes: []pipeline.MCENode{
 				{AXNodeID: 105, Role: "paragraph", SubtreeText: "not main", Box: [4]int{10, 10, 90, 90}},
 				{AXNodeID: 106, Role: "banner", Box: [4]int{0, 0, 0, 0}}, // degenerate box
-				{AXNodeID: 107, Role: "staticText", Text: "main text", Box: [4]int{100, 200, 600, 800}},
+				{AXNodeID: 107, Role: "staticText", Text: "main text", Box: [4]int{100, 200, 600, 800}, Selected: true, ContentType: "main", Order: 1},
 			},
 			CropBox: &crop,
 		},

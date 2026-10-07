@@ -244,7 +244,9 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 				Light: light, MaxDim: maxdim, MCE: wantMCE,
 				Languages: langs, MinConfidence: minConf,
 				ReaderFormat: readerFmt, CropMain: cropMain,
-				Effective: eng.Settings().Effective(),
+				ExcludeRegions: s2bool(eng.Settings().ExcludeRegions, true),
+				Tree:           eng.Settings().TreeOptions(),
+				Effective:      eng.Settings().Effective(),
 			})
 			return perr
 		})
@@ -356,4 +358,12 @@ border-radius:4px;color:#8ab4f8}</style></head><body><div>
 func htmlEscape(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&#34;", "'", "&#39;")
 	return r.Replace(s)
+}
+
+// s2bool resolves an optional settings boolean with a default.
+func s2bool(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
 }

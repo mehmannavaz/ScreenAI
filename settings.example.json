@@ -29,6 +29,7 @@
     "threshold_main": 0,
     "num_threads": 1,
     "chrome_post_process": true,
+    "exclude_regions": true,
     "crop_main": false
   },
   "reader": {
@@ -39,5 +40,14 @@
     "_doc": "HTML report overlays — highlight on the image what OCR and MCE detected",
     "ocr_boxes": true,
     "mce_boxes": true
+  },
+  "tree": {
+    "_doc": "Semantic page-tree construction — the roles Screen2x sees (heading/link/list/landmarks), rebuilt from OCR signals",
+    "detect_headings": true,
+    "detect_lists": true,
+    "detect_links": true,
+    "detect_regions": true,
+    "heading_min_ratio": 1.3,
+    "paragraph_gap": 0.75
   }
 }

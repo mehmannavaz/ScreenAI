@@ -25,7 +25,7 @@ const sampleTreeJSON = `{
 }`
 
 func TestFlattenInvariants(t *testing.T) {
-	tree, err := FromJSON([]byte(sampleTreeJSON))
+	tree, err := FromJSON([]byte(sampleTreeJSON), DefaultTreeOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestFlattenInvariants(t *testing.T) {
 }
 
 func TestSerializeMatchesChromiumShape(t *testing.T) {
-	tree, err := FromJSON([]byte(sampleTreeJSON))
+	tree, err := FromJSON([]byte(sampleTreeJSON), DefaultTreeOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestSerializeMatchesChromiumShape(t *testing.T) {
 
 func TestFromJSONOCROutputShape(t *testing.T) {
 	doc := `{"lines": [{"text": "hi", "box": {"x": 0, "y": 0, "width": 10, "height": 12, "angle": 0.0}, "confidence": 0.9, "block_id": 0}], "width": 100, "height": 50}`
-	tree, err := FromJSON([]byte(doc))
+	tree, err := FromJSON([]byte(doc), DefaultTreeOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestFromJSONOCROutputShape(t *testing.T) {
 
 func TestFromText(t *testing.T) {
 	text := "First paragraph here.\n\nSecond paragraph follows."
-	tree := FromText(text, 800)
+	tree := FromText(text, 800, DefaultTreeOptions())
 	if len(tree.Nodes) < 5 {
 		t.Fatalf("too few nodes: %d", len(tree.Nodes))
 	}
@@ -148,7 +148,7 @@ func TestFromHTML(t *testing.T) {
 }
 
 func TestComputeMainNode(t *testing.T) {
-	tree, err := FromJSON([]byte(sampleTreeJSON))
+	tree, err := FromJSON([]byte(sampleTreeJSON), DefaultTreeOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestNodeJSONRoundtrip(t *testing.T) {
 }
 
 func TestToJSON(t *testing.T) {
-	tree, err := FromJSON([]byte(sampleTreeJSON))
+	tree, err := FromJSON([]byte(sampleTreeJSON), DefaultTreeOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

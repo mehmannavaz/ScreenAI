@@ -58,6 +58,9 @@ func Run(componentDir string) []Result {
 	check("viewhierarchy-golden", testViewHierarchyGolden)
 	check("tree-flatten-invariants", testFlattenInvariants)
 	check("tree-fromhtml", testFromHTML)
+	check("tree-semantic", testTreeSemantic)
+	check("tree-fromtext", testTreeFromText)
+	check("tree-html-inline", testHTMLInline)
 	check("classify-sniffing", testClassify)
 	check("settings-template", testSettingsTemplate)
 	check("settings-json-nested", testSettingsJSONNested)
@@ -91,7 +94,7 @@ func testReportOverlay() error {
 			Ran: true, ContentAXNodeIDs: []int{107}, NodeCount: 2,
 			Nodes: []pipeline.MCENode{
 				{AXNodeID: 105, Role: "banner", Box: [4]int{10, 10, 90, 90}},
-				{AXNodeID: 107, Role: "staticText", Text: "main", Box: [4]int{100, 200, 600, 800}},
+				{AXNodeID: 107, Role: "staticText", Text: "main", Box: [4]int{100, 200, 600, 800}, Selected: true, ContentType: "main", Order: 1},
 			},
 			CropBox: &crop,
 		},
@@ -293,7 +296,7 @@ func testViewHierarchyGolden() error {
 	if err != nil {
 		return err
 	}
-	tree, err := pagetree.FromJSON(examples.Map()["example_4_page_tree.json"])
+	tree, err := pagetree.FromJSON(examples.Map()["example_4_page_tree.json"], pagetree.DefaultTreeOptions())
 	if err != nil {
 		return err
 	}
@@ -305,7 +308,7 @@ func testViewHierarchyGolden() error {
 }
 
 func testFlattenInvariants() error {
-	tree, err := pagetree.FromJSON(examples.Map()["example_4_page_tree.json"])
+	tree, err := pagetree.FromJSON(examples.Map()["example_4_page_tree.json"], pagetree.DefaultTreeOptions())
 	if err != nil {
 		return err
 	}
@@ -334,6 +337,171 @@ func testFlattenInvariants() error {
 		}
 	}
 	return nil
+}
+
+// testTreeSemantic feeds a synthetic annotation (the shape of a real
+// page: masthead, nav row, headline, byline, body paragraph, bullet
+// list, blue link, separator) through FromOCR and asserts the
+// semantic detectors produce the roles and structure Chrome's trees
+// carry — not the paragraph=staticText degeneracy.
+func testTreeSemantic() error {
+	ann := &pb.Annotation{Width: 1000, Height: 700}
+	mk := func(text string, x, y, w, h int, fg uint32) pb.Line {
+		v := fg
+		return pb.Line{
+			Text: text, Box: &pb.Rect{X: x, Y: y, Width: w, Height: h},
+			Words: []pb.Word{{Text: text, ForegroundRGB: &v}},
+		}
+	}
+	bodyInk := uint32(0x13131300) // near black
+	linkInk := uint32(0x1a73e800) // Google link blue
+	ann.Lines = []pb.Line{
+		mk("THE MORNING SIGNAL", 200, 13, 590, 48, bodyInk),
+		mk("World", 264, 91, 60, 15, bodyInk),
+		mk("Politics", 353, 92, 70, 15, bodyInk),
+		mk("Business", 451, 92, 75, 15, bodyInk),
+		mk("Cities Learn to Talk", 71, 190, 872, 36, bodyInk),
+		mk("By Amara Okafor", 70, 257, 400, 18, bodyInk),
+		mk("First body line of the article", 71, 346, 600, 21, bodyInk),
+		mk("Second body line continues", 70, 374, 590, 23, bodyInk),
+		mk("Third body line closes the paragraph", 71, 406, 610, 22, bodyInk),
+		mk("Fourth body line wraps the text", 70, 434, 585, 21, bodyInk),
+		mk("VoltBike S - 90 km", 701, 423, 187, 16, bodyInk),
+		mk("on one charge.", 701, 446, 144, 18, bodyInk),
+		mk("• Preheat the oven", 70, 500, 300, 20, bodyInk),
+		mk("• Bake for an hour", 70, 526, 280, 20, bodyInk),
+		mk("Read the study", 70, 600, 200, 20, linkInk),
+		mk("", 70, 660, 860, 2, bodyInk),                           // separator rule
+		mk("The Morning Signal ©2026", 69, 1338, 470, 16, bodyInk), // footer
+	}
+
+	tree := pagetree.FromOCR(ann, nil, 1000, 700, pagetree.DefaultTreeOptions())
+	roles := map[string]int{}
+	levels := map[int]int{}
+	textAligns := map[string]int{}
+	multiLinePara := false
+	tree.Root.Walk(func(n *pagetree.Node) {
+		roles[n.Role]++
+		if n.Role == "heading" && n.Level != nil {
+			levels[*n.Level]++
+		}
+		if n.TextAlign != "" {
+			textAligns[n.TextAlign]++
+		}
+		if n.Role == "paragraph" && len(n.Children) >= 3 {
+			multiLinePara = true
+		}
+	})
+	if roles["heading"] == 0 {
+		return fmt.Errorf("no heading detected from a 36px line over 21px body")
+	}
+	if levels[1] == 0 {
+		return fmt.Errorf("40px masthead should be a level-1 heading, got levels %v", levels)
+	}
+	if roles["list"] == 0 || roles["listItem"] < 2 {
+		return fmt.Errorf("bullet list not detected: roles %v", roles)
+	}
+	if roles["listItem"] < 5 {
+		// 3 nav items + 2 bullets
+		return fmt.Errorf("nav-row items not detected as list items: roles %v", roles)
+	}
+	if roles["link"] == 0 {
+		return fmt.Errorf("link-inked line (0x1a73e8) not detected as a link: roles %v", roles)
+	}
+	if roles["separator"] == 0 {
+		return fmt.Errorf("thin wide empty line not detected as a separator: roles %v", roles)
+	}
+	if roles["complementary"] == 0 {
+		return fmt.Errorf("right-side ad column not wrapped as complementary: roles %v", roles)
+	}
+	if roles["contentinfo"] == 0 {
+		return fmt.Errorf("trailing copyright strip not wrapped as contentinfo: roles %v", roles)
+	}
+	if !multiLinePara {
+		return fmt.Errorf("body paragraph did not merge its 3 lines (paragraph=staticText degeneracy is back)")
+	}
+	// text-align: the centered masthead must carry it, and it must
+	// round-trip through the proto encoder as the string attribute
+	// Chrome's convertor also sends.
+	if textAligns["center"] == 0 {
+		return fmt.Errorf("centered masthead should carry text-align center")
+	}
+	data := tree.Serialize()
+	if !bytes.Contains(data, []byte("/extras/styles/text-align")) {
+		return fmt.Errorf("text-align attribute not serialized into the ViewHierarchy proto")
+	}
+
+	// Detectors off = the tree degrades to the classic structure.
+	// (separator stays: converting empty thin rules is clean-up, not
+	// a detector.)
+	treeOff := pagetree.FromOCR(ann, nil, 1000, 700, pagetree.TreeOptions{ParagraphGap: 0.5})
+	rolesOff := map[string]int{}
+	treeOff.Root.Walk(func(n *pagetree.Node) { rolesOff[n.Role]++ })
+	for _, role := range []string{"heading", "link", "list", "listItem", "complementary", "contentinfo"} {
+		if rolesOff[role] != 0 {
+			return fmt.Errorf("detector-off tree still has %s nodes", role)
+		}
+	}
+	return nil
+}
+
+// testTreeFromText asserts the markdown-aware text tree: # headings,
+// bullet lists and blockquotes.
+func testTreeFromText() error {
+	text := "# Title\n\nIntro paragraph here.\n\n- one\n- two\n\n> a quote\n\n## Section\n\nBody text.\n"
+	tree := pagetree.FromText(text, 800, pagetree.DefaultTreeOptions())
+	roles := map[string]int{}
+	levels := map[int]int{}
+	tree.Root.Walk(func(n *pagetree.Node) {
+		roles[n.Role]++
+		if n.Level != nil {
+			levels[*n.Level]++
+		}
+	})
+	if roles["heading"] < 2 || levels[1] == 0 || levels[2] == 0 {
+		return fmt.Errorf("markdown headings not detected: roles %v levels %v", roles, levels)
+	}
+	if roles["list"] == 0 || roles["listItem"] < 2 {
+		return fmt.Errorf("markdown list not detected: roles %v", roles)
+	}
+	if roles["blockquote"] == 0 {
+		return fmt.Errorf("markdown blockquote not detected: roles %v", roles)
+	}
+	return testFlattenOf(tree)
+}
+
+// testHTMLInline asserts <a>/<strong> become their own nodes inside
+// paragraphs — the Chrome AX structure Screen2x expects.
+func testHTMLInline() error {
+	doc := `<html><body><p>See <a href="r.html">the recipe</a> and the <strong>notes</strong> too.</p></body></html>`
+	tree := pagetree.FromHTML(doc, 800)
+	var links, strongs int
+	var linkHasText, strongHasText bool
+	tree.Root.Walk(func(n *pagetree.Node) {
+		switch n.Role {
+		case "link":
+			links++
+			for _, c := range n.Children {
+				if c.Role == "staticText" && c.Text != "" {
+					linkHasText = true
+				}
+			}
+		case "strong":
+			strongs++
+			for _, c := range n.Children {
+				if c.Role == "staticText" && c.Text != "" {
+					strongHasText = true
+				}
+			}
+		}
+	})
+	if links == 0 || !linkHasText {
+		return fmt.Errorf("<a> did not become a link node with staticText children")
+	}
+	if strongs == 0 || !strongHasText {
+		return fmt.Errorf("<strong> did not become a strong node with staticText children")
+	}
+	return testFlattenOf(tree)
 }
 
 func testFromHTML() error {
@@ -469,6 +637,50 @@ func engineSmoke(componentDir string) error {
 	}
 	fmt.Printf("         (engine v%s, sample OCR: %d lines / %d words)\n",
 		eng.VersionString(), len(ann.Lines), ann.WordCount())
+
+	// Live semantic-tree + Screen2x regression check: the page tree
+	// built from the real OCR output must carry heading roles, and
+	// the reader view must contain the headline but NOT the sidebar
+	// ad (the landmark veto, mce.exclude_regions).
+	var mce *pipeline.MCE
+	err = eng.Session(func(sess *engine.Session) error {
+		tree := pagetree.FromOCR(ann, img, ann.Width, ann.Height, pagetree.DefaultTreeOptions())
+		var perr error
+		mce, perr = pipeline.RunMCE(sess, tree, true)
+		return perr
+	})
+	if err != nil {
+		return fmt.Errorf("live MCE run failed: %v", err)
+	}
+	roles := map[string]int{}
+	for _, n := range mce.Nodes {
+		roles[n.Role]++
+	}
+	if roles["heading"] == 0 {
+		return fmt.Errorf("live tree has no heading nodes (semantic detection broken)")
+	}
+	if roles["list"] == 0 || roles["listItem"] < 2 {
+		return fmt.Errorf("live tree has no nav list (list detection broken)")
+	}
+	readerText := ""
+	headings := 0
+	for _, part := range mce.Reader {
+		readerText += part.Text + "\n"
+		if part.Role == "heading" {
+			headings++
+		}
+	}
+	if headings == 0 {
+		return fmt.Errorf("reader view has no headings for an image input")
+	}
+	if strings.Contains(readerText, "VoltBike") {
+		return fmt.Errorf("sidebar ad leaked into the reader view (landmark veto broken)")
+	}
+	if !strings.Contains(readerText, "Traffic Lights") {
+		return fmt.Errorf("headline missing from the reader view")
+	}
+	fmt.Printf("         (live MCE: %d/%d nodes, %d headings, %d vetoed)\n",
+		len(mce.ContentAXNodeIDs), mce.NodeCount, headings, len(mce.VetoedAXNodeIDs))
 	return nil
 }
 

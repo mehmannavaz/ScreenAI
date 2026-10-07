@@ -41,8 +41,12 @@ type Node struct {
 	FontSize   *float64   `json:"font_size,omitempty"`
 	FontWeight *float64   `json:"font_weight,omitempty"`
 	Level      *int       `json:"level,omitempty"`
-	Display    string     `json:"display,omitempty"`
-	Children   []*Node    `json:"children,omitempty"`
+	// TextAlign is the /extras/styles/text-align value Chrome's
+	// convertor emits when the AX node has one ("left", "center",
+	// ...). Screen2x consumes it as a string feature.
+	TextAlign string  `json:"text_align,omitempty"`
+	Display   string  `json:"display,omitempty"`
+	Children  []*Node `json:"children,omitempty"`
 
 	// Assigned by Flatten:
 	ID       int // proto index (position in pre-order)
@@ -152,6 +156,9 @@ func (t *PageTree) flatten() {
 		}
 		if n.Level != nil {
 			attrs = append(attrs, pb.Int("hierarchical_level", *n.Level))
+		}
+		if n.TextAlign != "" {
+			attrs = append(attrs, pb.String("/extras/styles/text-align", n.TextAlign))
 		}
 		attrs = append(attrs,
 			pb.String("class_name", "chrome.unicorn"),

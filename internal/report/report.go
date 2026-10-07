@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,6 +109,7 @@ type OCRView struct {
 // ReaderView is one reader-view block.
 type ReaderView struct {
 	IsHeading bool
+	IsItem    bool
 	Text      string
 }
 
@@ -119,11 +121,15 @@ type OutlineView struct {
 
 // NodeView is one row of the MCE node table.
 type NodeView struct {
-	IsMain bool
-	AXNode int
-	Role   string
-	Box    string
-	Text   string
+	IsMain   bool
+	Type     string // headline | main | nonessential
+	Order    int
+	AXNode   int
+	Role     string
+	RoleNote string // "L2" for level-2 headings, "" otherwise
+	Box      string
+	Font     string
+	Text     string
 }
 
 // MCEView is the MCE section view model.
@@ -142,6 +148,8 @@ type MCEView struct {
 	ReadingSec  int
 	ClutterPct  string
 	CropBox     string
+	Headlines   int
+	Roles       string // selected-by-role summary, e.g. "2×heading · 5×paragraph"
 	Nodes       []NodeView
 }
 
@@ -277,18 +285,24 @@ func buildMCEView(view *MCEView, mce *pipeline.MCE) {
 		view.ReaderWords = mce.Stats.ReaderWords
 		view.ReadingSec = mce.Stats.ReadingSec
 		view.ClutterPct = fmt.Sprintf("%.1f%%", mce.Stats.ClutterPct)
+		view.Headlines = mce.Stats.Headlines
+		if len(mce.Stats.SelectedByRole) > 0 {
+			roles := make([]string, 0, len(mce.Stats.SelectedByRole))
+			for role, n := range mce.Stats.SelectedByRole {
+				roles = append(roles, fmt.Sprintf("%d×%s", n, role))
+			}
+			sort.Strings(roles)
+			view.Roles = strings.Join(roles, " · ")
+		}
 	}
 	if mce.CropBox != nil {
 		view.CropBox = fmt.Sprintf("%d,%d,%d,%d", mce.CropBox[0], mce.CropBox[1], mce.CropBox[2], mce.CropBox[3])
 	}
 
-	selected := map[int]bool{}
-	for _, ax := range mce.ContentAXNodeIDs {
-		selected[ax] = true
-	}
 	for _, part := range mce.Reader {
 		view.Reader = append(view.Reader, ReaderView{
 			IsHeading: part.Role == "heading",
+			IsItem:    part.Role == "listItem",
 			Text:      part.Text,
 		})
 	}
@@ -303,11 +317,23 @@ func buildMCEView(view *MCEView, mce *pipeline.MCE) {
 		if len(text) > 70 {
 			text = text[:70]
 		}
+		roleNote := ""
+		if n.Level != nil {
+			roleNote = fmt.Sprintf("L%d", *n.Level)
+		}
+		font := ""
+		if n.FontSize > 0 {
+			font = fmt.Sprintf("%.0fpx", n.FontSize)
+		}
 		view.Nodes = append(view.Nodes, NodeView{
-			IsMain: selected[n.AXNodeID],
+			IsMain: n.Selected,
+			Type:   n.ContentType,
+			Order:  n.Order,
 			AXNode: n.AXNodeID, Role: n.Role,
-			Box:  fmt.Sprintf("%d,%d,%d,%d", n.Box[0], n.Box[1], n.Box[2], n.Box[3]),
-			Text: text,
+			RoleNote: roleNote,
+			Box:      fmt.Sprintf("%d,%d,%d,%d", n.Box[0], n.Box[1], n.Box[2], n.Box[3]),
+			Font:     font,
+			Text:     text,
 		})
 	}
 }
@@ -352,32 +378,41 @@ func buildStageView(view *StageView, data *pipeline.ReportData) {
 		}
 	}
 
-	// Main-content layer — one green box per Screen2x-selected node,
-	// plus the dashed union box (the region mce.crop_main crops).
+	// Main-content layer — one box per Screen2x-selected node:
+	// amber for headline content, green for body content, plus
+	// the dashed union box (the region mce.crop_main crops).
 	if data.MCEBoxesOn && data.MCE != nil && data.MCE.Ran {
-		selected := map[int]bool{}
-		for _, ax := range data.MCE.ContentAXNodeIDs {
-			selected[ax] = true
+		typeByAX := map[int]string{}
+		for i := range data.MCE.Nodes {
+			typeByAX[data.MCE.Nodes[i].AXNodeID] = data.MCE.Nodes[i].ContentType
 		}
 		w, h := float64(view.ImageW), float64(view.ImageH)
 		for _, n := range data.MCE.Nodes {
-			if !selected[n.AXNodeID] {
+			if !n.Selected {
 				continue
 			}
 			if n.Box[2] <= n.Box[0] || n.Box[3] <= n.Box[1] {
 				continue // degenerate / boxless node
 			}
-			title := n.Role
+			role := n.Role
+			if n.Level != nil {
+				role = fmt.Sprintf("%s (L%d)", role, *n.Level)
+			}
+			title := role + " [" + typeByAX[n.AXNodeID] + "]"
 			if text := firstNonEmpty(n.Text, n.SubtreeText); text != "" {
 				title += " — " + truncateText(text, 60)
 			}
+			style := fmt.Sprintf(
+				"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%",
+				float64(n.Box[0])*100/w,
+				float64(n.Box[1])*100/h,
+				float64(n.Box[2]-n.Box[0])*100/w,
+				float64(n.Box[3]-n.Box[1])*100/h)
+			if typeByAX[n.AXNodeID] == "headline" {
+				style += ";border-color:#fdd663;background:rgba(253,214,99,.10)"
+			}
 			view.MCEBoxes = append(view.MCEBoxes, BoxView{
-				Style: template.CSS(fmt.Sprintf(
-					"left:%.3f%%;top:%.3f%%;width:%.3f%%;height:%.3f%%",
-					float64(n.Box[0])*100/w,
-					float64(n.Box[1])*100/h,
-					float64(n.Box[2]-n.Box[0])*100/w,
-					float64(n.Box[3]-n.Box[1])*100/h)),
+				Style: template.CSS(style),
 				Title: title,
 			})
 		}

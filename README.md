@@ -52,6 +52,58 @@ badges), and an `index.html` hub. With
 `--reader` it also writes `{name}.reader.md` (or `.txt` / `.html`), and
 with `--crop-main` the `{name}.main.png` crop of the main-content region.
 
+## Semantic page tree — the roles Screen2x actually eats
+
+Deep analysis of `screen2x_config.pbtxt` shows the main-content model
+is a **message-passing GNN** with a dedicated categorical
+`chrome_role` input (and a `chrome_role_description` string) plus
+numeric features per node. Chrome's own accessibility trees always
+feed it rich roles — `heading` with `hierarchical_level`, `link`,
+`list`, `listItem`, `banner`, `complementary`… — while a naive OCR
+wrapper feeds it `rootWebArea/paragraph/staticText` and starves the
+model's main structural feature.
+
+This wrapper **reconstructs the roles Chrome would send** from signals
+the OCR annotation itself carries:
+
+| role | detected from | notes |
+|---|---|---|
+| `heading` + `hierarchical_level` | line height vs the area-weighted body size (ratio ≥ `tree.heading_min_ratio`) | h1 for ~2× body, h2 ~1.6×, …; wrapped headline lines merge; weight 700 |
+| `list` / `listItem` | bullet/number markers (`•`, `1.`, `a)`…) **and** horizontal runs of short same-row lines (nav bars, footer link rows) | wrapped item lines join their item |
+| `link` | the engine's per-word `foreground_rgb` (link blue/purple ink) or a solid underline row in the pixels | packed `0xRRGGBB00`, no guessing |
+| `complementary` | narrow side columns interleaved with main-column content | Chrome's `aside` landmark |
+| `contentinfo` | trailing strip after a ≥2.5 body-height gap | Chrome's `footer` landmark |
+| `separator` | empty thin wide lines / `content_type: separator` | rule lines, not empty text nodes |
+| `image` | `content_type: image` lines | |
+
+Paragraph lines merge across OCR blocks on real typography signals
+(vertical gap ≤ `tree.paragraph_gap` × body height, left alignment,
+size, column overlap) — so paragraphs contain several `staticText`
+children exactly like Chrome's trees, instead of the
+degenerate `paragraph = staticText` duplication. The builder also
+emits `/extras/styles/text-align` (a string attribute Chrome's
+convertor sends) for centered content. HTML inputs get the same
+treatment natively: `<a>`/`<strong>`/`<em>`/`<code>` become real
+`link`/`strong`/`emphasis` nodes inside paragraphs, and markdown text
+(`#`, bullets, `>` quotes) maps to headings/lists/blockquotes.
+
+Every detector is a setting (`tree.*` group) and a flag:
+
+```sh
+screenai run --no-links page.png           # keep links as plain text
+screenai run --heading-ratio 1.6 page.png   # only clear display sizes
+screenai run --set tree.detect_regions=false page.png
+```
+
+| setting | default | mechanism | what it does |
+|---|---|---|---|
+| `tree.detect_headings` | `true` | wrapper | mark clearly larger lines as `heading` + level |
+| `tree.detect_lists` | `true` | wrapper | bullet/numbered lines and nav rows → `list`/`listItem` |
+| `tree.detect_links` | `true` | wrapper | link-coloured / underlined lines → `link` |
+| `tree.detect_regions` | `true` | wrapper | side columns → `complementary`, trailing strip → `contentinfo` |
+| `tree.heading_min_ratio` | `1.3` | wrapper | height ratio over body that makes a heading |
+| `tree.paragraph_gap` | `0.75` | wrapper | max line gap (× body height) merging into one paragraph |
+
 ## MCE abilities beyond the ids
 
 `ExtractMainContent` returns selected node ids, but the wrapper turns
@@ -60,16 +112,32 @@ what the Screen2x model actually picked, never invented:
 
 - **Reader view** (`--reader`, setting `reader.format`): the distilled
   main content, exported as **markdown** (headings keep their h1–h6
-  levels), **text** (underlined headings) or **html** (`<article>` with
-  semantic tags). `--print` dumps it to stdout; the server returns it
-  as `reader_view`.
+  levels — including on **image inputs**, via the semantic tree; list
+  items render as bullets), **text** (underlined headings) or **html**
+  (`<article>` with semantic tags). `--print` dumps it to stdout; the
+  server returns it as `reader_view`.
 - **Outline**: every heading inside the main content, in reading order
   (`outline` in the MCE JSON; also shown in the HTML report).
+- **Per-node content type**: every node carries `content_type`
+  `headline | main | nonessential` — the model itself predicts three
+  classes (`CONTENT_NON_ESSENTIAL`, `CONTENT_TEXT_HEADLINE`,
+  `CONTENT_TEXT_MAIN` in screen2x_config.pbtxt), but the C API exposes
+  only the selection, so the headline/main split is derived from the
+  heading roles (documented, not invented).
+- **Reading order**: selected nodes carry `order` (1-based, tree
+  order) — the sequence the reader view emits.
 - **Stats** (`stats` in the MCE JSON): selected/total nodes, kept
-  ratio, clutter dropped %, reader words, chars, and an estimated
-  reading time (200 wpm).
-- **Per-node selection**: every node in the MCE JSON now carries
-  `selected: true/false`.
+  ratio, clutter dropped %, reader words, chars, reading time
+  (200 wpm), headline count and the selected-role mix
+  (`selected_by_role`).
+- **Per-node selection**: every node in the MCE JSON carries
+  `selected: true/false`, plus `level` and `font_size`.
+- **Landmark veto** (`mce.exclude_regions`, default `true`):
+  Screen2x occasionally keeps sidebar ads or copyright strips; nodes
+  selected inside `complementary`/`contentinfo` landmarks are demoted
+  from the reader view/stats/crop (the raw model selection stays in
+  `content_axnode_ids`, the demoted ids in `vetoed_axnode_ids`).
+  `--keep-regions` opts out.
 - **Main-content crop** (`--crop-main`, setting `mce.crop_main`):
   images get `{name}.main.png` — the union bounding box of the
   selection cropped pixel-exact from the image the OCR saw (4px
@@ -86,8 +154,10 @@ just read about it:
   the model's confidence for that line (green ≥ .95, blue ≥ .80,
   yellow ≥ .60, red below). Hover a box for its text and confidence.
 - **Main-content layer**: a filled green box per Screen2x-selected
-  node (hover for role and text) plus a dashed box around the whole
-  main-content region — the exact region `--crop-main` crops.
+  node — **amber when the node is headline content** (a heading) —
+  plus a dashed box around the whole main-content region: the exact
+  region `--crop-main` crops. Hover any box for role, level, content
+  type and text.
 
 Both layers have a toggle pill above the image (click to flip a layer
 on/off while reading — no regeneration needed), and each layer can be
@@ -140,10 +210,17 @@ the real binary (run `screenai selftest` to re-prove it on your machine):
 | `mce.threshold_main` | `0.0` | pbtxt | main-content class threshold |
 | `mce.num_threads` | `1` | pbtxt | Screen2x TFLite inference threads |
 | `mce.chrome_post_process` | `true` | pbtxt | Chrome-specific post-processing |
+| `mce.exclude_regions` | `true` | wrapper | demote selections inside `complementary`/`contentinfo` landmarks — sidebar ads and copyright strips stay out of the reader view; raw ids preserved in `vetoed_axnode_ids` |
 | `mce.crop_main` | `false` | wrapper | crop the main-content region out of the image → `<stem>.main.png` + `crop_box` (images only) |
 | `reader.format` | `none` | wrapper | export the reader view: `text` \| `markdown` \| `html` → `<stem>.reader.*` |
 | `report.ocr_boxes` | `true` | wrapper | embed the OCR line-box overlay layer in the HTML report (see [HTML report overlays](#html-report-overlays--see-exactly-what-was-done)) |
 | `report.mce_boxes` | `true` | wrapper | embed the main-content overlay layer + dashed region box in the HTML report |
+| `tree.detect_headings` | `true` | wrapper | rebuild `heading` + `hierarchical_level` roles from OCR line sizes (see [Semantic page tree](#semantic-page-tree--the-roles-screen2x-actually-eats)) |
+| `tree.detect_lists` | `true` | wrapper | bullets/numbered lines and same-row nav runs → `list`/`listItem` |
+| `tree.detect_links` | `true` | wrapper | link-inked (engine `foreground_rgb`) or underlined lines → `link` |
+| `tree.detect_regions` | `true` | wrapper | side columns → `complementary` (aside), trailing strip → `contentinfo` (footer) |
+| `tree.heading_min_ratio` | `1.3` | wrapper | height ratio over body text that makes a heading |
+| `tree.paragraph_gap` | `0.75` | wrapper | max line gap (× body height) that merges lines into one paragraph |
 
 ### settings.json
 

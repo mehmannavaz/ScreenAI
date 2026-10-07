@@ -72,6 +72,13 @@ flags (run/demo):
   --no-ocr-boxes  omit the OCR box overlay from the HTML report
   --no-mce-boxes  omit the main-content box overlay from the HTML report
   --no-boxes      omit both overlays (= --no-ocr-boxes --no-mce-boxes)
+  --no-headings   skip heading detection in the page tree
+  --no-lists      skip list detection in the page tree
+  --no-links      skip link detection in the page tree
+  --no-regions    skip side-column/footer region detection in the page tree
+  --keep-regions  keep aside/footer landmark text in the main content
+  --heading-ratio R  height ratio over body that makes a heading (default 1.3)
+  --para-gap G    max line gap (× body height) merging lines into a paragraph (default 0.75)
   --print         print the reader view to stdout
   --set K=V       override any setting (repeatable; see ` + "`screenai settings`" + `)
   --settings FILE JSON file of settings overrides
@@ -328,6 +335,13 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 	noOCRBoxes := fs.Bool("no-ocr-boxes", false, "omit the OCR box overlay from the HTML report")
 	noMCEBoxes := fs.Bool("no-mce-boxes", false, "omit the main-content box overlay from the HTML report")
 	noBoxes := fs.Bool("no-boxes", false, "omit both overlays from the HTML report")
+	noHeadings := fs.Bool("no-headings", false, "skip heading detection in the page tree (= --set tree.detect_headings=false)")
+	noLists := fs.Bool("no-lists", false, "skip list detection in the page tree (= --set tree.detect_lists=false)")
+	noLinks := fs.Bool("no-links", false, "skip link detection in the page tree (= --set tree.detect_links=false)")
+	noRegions := fs.Bool("no-regions", false, "skip side-column/footer region detection (= --set tree.detect_regions=false)")
+	keepRegions := fs.Bool("keep-regions", false, "keep aside/footer landmark text in the main content (= --set mce.exclude_regions=false)")
+	headingRatio := fs.Float64("heading-ratio", 0, "height ratio over body text that makes a heading (default 1.3)")
+	paraGap := fs.Float64("para-gap", 0, "max line gap (× body height) that merges lines into a paragraph (default 0.75)")
 
 	return func() (*settings.Settings, error) {
 		s := settings.Default()
@@ -384,6 +398,29 @@ func addSettingsFlags(fs *flag.FlagSet) func() (*settings.Settings, error) {
 		}
 		if (*noMCEBoxes || *noBoxes) && s.ReportMCEBoxes == nil {
 			s.ReportMCEBoxes = boolPtr(false)
+		}
+		// --no-headings / --no-lists / --no-links / --heading-ratio /
+		// --para-gap are sugar; explicit --set / settings.json win.
+		if *noHeadings && s.TreeDetectHeadings == nil {
+			s.TreeDetectHeadings = boolPtr(false)
+		}
+		if *noLists && s.TreeDetectLists == nil {
+			s.TreeDetectLists = boolPtr(false)
+		}
+		if *noLinks && s.TreeDetectLinks == nil {
+			s.TreeDetectLinks = boolPtr(false)
+		}
+		if *noRegions && s.TreeDetectRegions == nil {
+			s.TreeDetectRegions = boolPtr(false)
+		}
+		if *keepRegions && s.ExcludeRegions == nil {
+			s.ExcludeRegions = boolPtr(false)
+		}
+		if *headingRatio > 0 && s.TreeHeadingMinRatio == nil {
+			s.TreeHeadingMinRatio = headingRatio
+		}
+		if *paraGap > 0 && s.TreeParagraphGap == nil {
+			s.TreeParagraphGap = paraGap
 		}
 		return s, nil
 	}
@@ -571,8 +608,10 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 		MinConfidence:  s.MinConfidence,
 		ReaderFormat:   opts.readerFmt,
 		CropMain:       opts.cropMain,
+		ExcludeRegions: s.ExcludeRegions == nil || *s.ExcludeRegions,
 		ReportOCRBoxes: s.ReportOCRBoxes,
 		ReportMCEBoxes: s.ReportMCEBoxes,
+		Tree:           s.TreeOptions(),
 		Effective:      s.Effective(),
 	}
 
