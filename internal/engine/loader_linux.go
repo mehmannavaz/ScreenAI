@@ -15,7 +15,7 @@ import (
 //
 // The no-op threadlogger shim is loaded first with RTLD_GLOBAL so the
 // component's reference to threadlogger::EnableThreadedLogging resolves.
-func loadLibrary(path string, sizeFn func(*byte) uint32, contentFn func(*byte, uint32, *byte)) (*library, error) {
+func loadLibrary(path string, sizeFn func(*byte) uintptr, contentFn func(*byte, uint32, *byte) uintptr) (*library, error) {
 	if shimPath, err := ensureThreadLoggerShim(filepath.Dir(path)); err == nil {
 		if _, err := purego.Dlopen(shimPath, purego.RTLD_NOW|purego.RTLD_GLOBAL); err != nil {
 			return nil, fmt.Errorf("loading threadlogger shim %s: %w", shimPath, err)

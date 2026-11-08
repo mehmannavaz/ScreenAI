@@ -78,19 +78,33 @@ func (c *modelFileCache) read(rel string) []byte {
 
 // sizeCB implements uint32_t (*)(const char*): the byte size of a model
 // file, 0 when unknown.
-func (c *modelFileCache) sizeCB(name *byte) uint32 {
+//
+// The Go result is uintptr, not uint32: purego.NewCallback on Windows
+// delegates to syscall.NewCallback, whose runtime check accepts exactly
+// one pointer-sized result — a uint32 result panics with
+// "compileCallback: expected function with one uintptr-sized result".
+// The library reads only the low 32 bits of the return register, so the
+// value it sees is unchanged.
+func (c *modelFileCache) sizeCB(name *byte) uintptr {
 	data := c.read(cString(name))
 	if len(data) >= 0xFFFFFFFF {
 		return 0xFFFFFFFF
 	}
-	return uint32(len(data))
+	return uintptr(len(data))
 }
 
 // contentCB implements void (*)(const char*, uint32_t, char*): copies the
 // file into the library-provided buffer (up to its size).
-func (c *modelFileCache) contentCB(name *byte, bufferSize uint32, buffer *byte) {
+//
+// The Go result is uintptr because purego.NewCallback on Windows
+// delegates to syscall.NewCallback, whose runtime check requires exactly
+// one pointer-sized result — a void signature panics with
+// "compileCallback: expected function with one uintptr-sized result".
+// The library declares the callback void, so the returned 0 is never
+// read.
+func (c *modelFileCache) contentCB(name *byte, bufferSize uint32, buffer *byte) uintptr {
 	if buffer == nil || bufferSize == 0 {
-		return
+		return 0
 	}
 	data := c.read(cString(name))
 	n := len(data)
@@ -100,6 +114,7 @@ func (c *modelFileCache) contentCB(name *byte, bufferSize uint32, buffer *byte) 
 	if n > 0 {
 		copy(unsafe.Slice(buffer, int(bufferSize))[:n], data[:n])
 	}
+	return 0
 }
 
 // cString converts a NUL-terminated C string to a Go string (empty for

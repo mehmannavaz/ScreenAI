@@ -17,7 +17,13 @@ import (
 // The Windows component has no threadlogger dependency, so no shim is
 // involved. On x64 there is a single calling convention, so the plain C
 // declarations bind directly.
-func loadLibrary(path string, sizeFn func(*byte) uint32, contentFn func(*byte, uint32, *byte)) (*library, error) {
+//
+// Callback results must be exactly one pointer-sized value:
+// syscall.NewCallback — under purego.NewCallback — rejects any other
+// result shape at load time with a panic, so the library's uint32_t and
+// void callback signatures are modeled in Go with a uintptr result (see
+// modelfiles.go).
+func loadLibrary(path string, sizeFn func(*byte) uintptr, contentFn func(*byte, uint32, *byte) uintptr) (*library, error) {
 	dll, err := syscall.LoadDLL(path)
 	if err != nil {
 		return nil, fmt.Errorf("LoadLibrary %s: %w", path, err)
