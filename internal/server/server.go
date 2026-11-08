@@ -234,6 +234,16 @@ func apiProcess(w http.ResponseWriter, r *http.Request, eng *engine.Engine, st *
 	st.requests.Add(1)
 	t0 := time.Now()
 	inp, err := pipeline.Classify(data, name, "", name)
+	if err == nil && inp.Kind == pipeline.KindPDF {
+		// PDFs are expanded page by page — a multi-page response does
+		// not fit the single-result API shape, so the server points at
+		// the CLI instead of silently processing page one only.
+		st.errors.Add(1)
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"ok": false, "name": name,
+			"error": "PDF support is page-by-page — use the CLI: screenai run --reader file.pdf (POST page images or HTML documents here instead)"})
+		return
+	}
 	if err == nil {
 		// The whole pipeline runs under the engine lock (Session) so a
 		// light-mode switch cannot interleave with another request.

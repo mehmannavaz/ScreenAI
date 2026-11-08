@@ -4,6 +4,9 @@ github.com/ebitengine/purego
 github.com/ebitengine/purego/internal/cgo
 github.com/ebitengine/purego/internal/fakecgo
 github.com/ebitengine/purego/internal/strings
+# github.com/ledongthuc/pdf v0.0.0-20261020125853-5e46805f718e
+## explicit; go 1.24.1
+github.com/ledongthuc/pdf
 # golang.org/x/image v0.45.0
 ## explicit; go 1.25.0
 golang.org/x/image/bmp

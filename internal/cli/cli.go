@@ -33,8 +33,8 @@ import (
 var Version = "dev"
 
 const usage = `screenai — run Google's real closed-source Screen AI (OCR + Screen2x
-main content) on any input: images (PNG/JPEG/GIF/BMP/TGA/PPM), HTML pages,
-JSON page trees, plain text.
+main content) on any input: images (PNG/JPEG/GIF/BMP/TGA/PPM), PDF documents
+(text layer, page by page), HTML pages, JSON page trees, plain text.
 
 usage:
   screenai [command] [flags] [inputs...]
@@ -92,6 +92,8 @@ examples:
   screenai download
   screenai info
   screenai run photo.png page.html notes.txt
+  screenai run paper.pdf                       # every page through Screen2x
+  screenai run --reader paper.pdf              # + merged document reader view
   screenai run --langs en --min-conf 0.8 scan.png
   screenai run --reader --crop-main article.png
   screenai run --set mce.threshold_non_essential=0.9 photo.png
@@ -548,6 +550,51 @@ func cmdInit(args []string) int {
 	return 0
 }
 
+// pageNumbers renders a compact "2, 5, 7" list of page numbers.
+func pageNumbers(pages []int) string {
+	parts := make([]string, len(pages))
+	for i, p := range pages {
+		parts[i] = fmt.Sprintf("%d", p)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// writeMergedReader concatenates the per-page reader views of one PDF
+// into a single document-level export: {stem}.reader.{ext}, separated
+// by markdown horizontal rules (text: blank lines). HTML exports stay
+// per-page — full documents would not concatenate cleanly. When
+// printReader is set the merged view is printed instead of each page's.
+func writeMergedReader(outdir, source, format string, readers []string, printReader bool) {
+	var views []string
+	for _, r := range readers {
+		if strings.TrimSpace(r) != "" {
+			views = append(views, r)
+		}
+	}
+	if len(views) == 0 || format == "html" {
+		if printReader && len(views) > 0 {
+			for _, v := range views {
+				fmt.Printf("%s\n", v)
+			}
+		}
+		return
+	}
+	sep := "\n\n"
+	if format == "markdown" {
+		sep = "\n\n---\n\n"
+	}
+	merged := strings.Join(views, sep)
+	if printReader {
+		fmt.Printf("--- reader view (%s, %d pages merged) ---\n%s", format, len(views), merged)
+	}
+	path := filepath.Join(outdir, report.Stem(source)+".reader."+pipeline.ReaderExtension(format))
+	if err := os.WriteFile(path, []byte(merged), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+		return
+	}
+	fmt.Printf("      reader: %s (%d pages merged)\n", path, len(views))
+}
+
 func cmdInfo(eng *engine.Engine) int {
 	fmt.Println("Chrome Screen AI — the real closed-source binary")
 	fmt.Printf("  component dir : %s\n", eng.ComponentDir())
@@ -616,35 +663,31 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 	}
 
 	var entries []report.Entry
-	failures := 0
-	for _, source := range sources {
-		fmt.Printf("[input] %s\n", source)
-		inp, err := pipeline.Load(source)
-		if err != nil {
-			failures++
-			fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
-			continue
-		}
+
+	// process runs one input through the engine and writes its result
+	// files. It returns the input's reader view ("" when none) and
+	// whether it succeeded; the caller owns failure counting. printPage
+	// suppresses the per-input --print for PDF pages, whose reader views
+	// are printed merged instead.
+	process := func(inp *pipeline.Input, display string, printPage bool) (string, bool) {
 		var res *pipeline.Result
 		var rep *pipeline.ReportData
-		err = eng.Session(func(sess *engine.Session) error {
+		err := eng.Session(func(sess *engine.Session) error {
 			var perr error
 			res, rep, perr = pipeline.Process(sess, inp, popts)
 			return perr
 		})
 		if err != nil {
-			failures++
 			fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
-			continue
+			return "", false
 		}
 		entry, err := report.WriteResults(opts.outdir, res, rep, inp.Name, opts.html)
 		if err != nil {
-			failures++
 			fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
-			continue
+			return "", false
 		}
 		entries = append(entries, entry)
-		fmt.Printf("[ok] %s: %s\n", inp.Name, entry.Summary)
+		fmt.Printf("[ok] %s: %s\n", display, entry.Summary)
 		if res.OCR != nil {
 			fmt.Printf("      %d lines, %d words, conf %.3f\n",
 				len(res.OCR.Lines), res.OCR.WordCount(), res.OCR.AvgConfidence())
@@ -663,8 +706,65 @@ func cmdRun(eng *engine.Engine, sources []string, opts runOptions, s *settings.S
 			fmt.Printf("      crop: %s.main.png (%d bytes)\n",
 				filepath.Join(opts.outdir, report.Stem(inp.Name)), len(rep.MainPNG))
 		}
-		if opts.printReader && rep.ReaderView != "" {
+		if printPage && opts.printReader && rep.ReaderView != "" {
 			fmt.Printf("--- reader view (%s) ---\n%s", rep.ReaderFormat, rep.ReaderView)
+		}
+		return rep.ReaderView, true
+	}
+
+	// readerActive reports whether the reader-view export is on, with a
+	// format we can merge across PDF pages.
+	readerActive := func() (string, bool) {
+		f, err := settings.NormalizeReaderFormat(opts.readerFmt)
+		if err != nil || (f != "text" && f != "markdown" && f != "html") {
+			return "", false
+		}
+		return f, true
+	}
+
+	failures := 0
+	for _, source := range sources {
+		fmt.Printf("[input] %s\n", source)
+		inp, err := pipeline.Load(source)
+		if err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+			continue
+		}
+
+		if inp.Kind == pipeline.KindPDF {
+			exp, err := pipeline.ExpandPDF(inp)
+			if err != nil {
+				failures++
+				fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+				continue
+			}
+			fmt.Printf("  pdf: %d page(s)", exp.Total)
+			if len(exp.NoText) > 0 {
+				fmt.Printf(", %d without a text layer (scanned — skipped): pages %s",
+					len(exp.NoText), pageNumbers(exp.NoText))
+			}
+			fmt.Println()
+
+			mergeFmt, merging := readerActive()
+			var readers []string
+			for _, page := range exp.Pages {
+				display := fmt.Sprintf("%s p%d/%d", inp.Name, page.Page, page.PageCount)
+				reader, ok := process(page, display, false)
+				if !ok {
+					failures++
+					continue
+				}
+				readers = append(readers, reader)
+			}
+			if merging {
+				writeMergedReader(opts.outdir, source, mergeFmt, readers, opts.printReader)
+			}
+			continue
+		}
+
+		if _, ok := process(inp, inp.Name, true); !ok {
+			failures++
 		}
 	}
 

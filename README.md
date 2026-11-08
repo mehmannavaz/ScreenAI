@@ -9,6 +9,7 @@ Windows**:
 | input | what runs | output |
 |---|---|---|
 | PNG, JPEG, GIF, BMP, TGA, PPM/PGM/PBM | **PerformOCR** (word-level OCR) + Screen2x main content | OCR JSON + boxes, MCE JSON, HTML report |
+| PDF documents (text layer) | Screen2x **ExtractMainContent** per page, on the tree built from the text layer's exact geometry | per-page OCR-style JSON + boxes, MCE JSON, HTML report, merged reader view |
 | HTML pages | Screen2x **ExtractMainContent** on an estimated a11y tree | reader view, main-content nodes |
 | JSON page trees | Screen2x | reader view, main-content nodes |
 | plain text | Screen2x | reader view, main-content nodes |
@@ -36,6 +37,8 @@ then:
 $ ./screenai download              # fetch the component from Google (~124 MB, resumable)
 $ ./screenai info                  # engine status
 $ ./screenai run photo.png page.html notes.txt -o results
+$ ./screenai run paper.pdf         # every page through Screen2x
+$ ./screenai run --reader paper.pdf # + merged document reader view
 $ ./screenai run --reader --crop-main article.png   # reader view + main-content crop
 $ ./screenai run --no-boxes article.png            # HTML report without overlays
 $ ./screenai demo                   # run the bundled examples
@@ -51,6 +54,29 @@ everything the models detected**, reader view, outline, stats, MAIN
 badges), and an `index.html` hub. With
 `--reader` it also writes `{name}.reader.md` (or `.txt` / `.html`), and
 with `--crop-main` the `{name}.main.png` crop of the main-content region.
+
+## PDF pages — the text layer, not the pixels
+
+`screenai run paper.pdf` parses each page's **text layer** — the
+per-glyph origins, baselines and font sizes a PDF viewer renders from —
+and turns it into the same annotation structure PerformOCR produces,
+boxes and all (confidence 1.0: the text layer is exact, there is no
+recognition error). Every page then flows through the full pipeline:
+the semantic tree (headings from the real font sizes, lists, columns as
+separate lines, landmarks) → **Screen2x** → per-page
+`{doc}.p{N}.ocr.json` / `.mce.json` / `.report.html`, plus — with
+`--reader` — one merged `{doc}.reader.md` for the whole document.
+
+Because no pixels are involved, **the OCR model is never loaded**: a
+PDF-only run needs only the Screen2x half of the component. Pages
+without a text layer (scans) are skipped with a warning; a PDF whose
+pages carry no text at all is rejected with the rasterize-to-PNG
+instruction. PDFs encrypted with an empty user password (the common
+printable-but-"protected" case) open transparently. The parser is pure
+Go (`github.com/ledongthuc/pdf`, no cgo — the binary stays a single
+static executable), handles embedded fonts with declared widths and
+standard-14 fonts without (via estimated advances), and splits
+same-baseline columns into separate lines.
 
 ## Semantic page tree — the roles Screen2x actually eats
 

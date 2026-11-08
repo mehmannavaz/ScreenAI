@@ -588,12 +588,16 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 		MCEBoxesOn: opts.ReportMCEBoxes == nil || *opts.ReportMCEBoxes,
 	}
 
-	if opts.Light != s.OCRLightMode() {
+	// The OCR light-mode switch is image-pipeline state; PDF pages never
+	// touch the OCR model, so they skip it (and a PDF-only run needs no
+	// OCR model downloaded at all).
+	if inp.Kind != KindPDFPage && opts.Light != s.OCRLightMode() {
 		s.SetOCRLightMode(opts.Light)
 	}
 
 	var pipelineErr error
-	if inp.Kind == KindImage {
+	switch {
+	case inp.Kind == KindImage:
 		ann, img, err := RunOCR(s, inp, opts.MaxDim)
 		if err != nil {
 			pipelineErr = err
@@ -643,7 +647,32 @@ func Process(s *engine.Session, inp *Input, opts Options) (*Result, *ReportData,
 				}
 			}
 		}
-	} else {
+	case inp.Kind == KindPDFPage:
+		// One PDF page: the text layer was already turned into an
+		// annotation by ExpandPDF — no OCR model is involved at all,
+		// so a PDF run works even without the OCR model downloaded.
+		// The language filter needs detected languages and the text
+		// layer carries none, so only the confidence floor applies
+		// (harmless: text-layer lines are exact, confidence 1).
+		if inp.Ann == nil {
+			pipelineErr = fmt.Errorf("pipeline: pdfpage input %q carries no annotation", inp.Name)
+		} else {
+			ann, filter := FilterAnnotation(inp.Ann, nil, opts.MinConfidence)
+			res.Filter = filter
+			res.OCR, rep.OCR = ann, ann
+			res.Width, res.Height = inp.Width, inp.Height
+			if opts.MCE {
+				tree := pagetree.FromOCR(ann, nil, inp.Width, inp.Height, opts.Tree)
+				mce, err := RunMCE(s, tree, opts.ExcludeRegions)
+				if err != nil {
+					pipelineErr = err
+				} else {
+					res.MCE, rep.MCE = mce, mce
+					finishMCEDerived(res, rep, mce, opts)
+				}
+			}
+		}
+	default:
 		tree, err := TreeForInput(inp, opts.Tree)
 		if err != nil {
 			pipelineErr = err

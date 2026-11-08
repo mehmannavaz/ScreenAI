@@ -5,6 +5,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mehmannavaz/ScreenAI/internal/imaging"
+	"github.com/mehmannavaz/ScreenAI/internal/pb"
 )
 
 // Kind classifies an input.
@@ -25,10 +27,12 @@ type Kind string
 
 // Input kinds.
 const (
-	KindImage Kind = "image"
-	KindPage  Kind = "page"
-	KindTree  Kind = "tree"
-	KindText  Kind = "text"
+	KindImage   Kind = "image"
+	KindPage    Kind = "page"
+	KindTree    Kind = "tree"
+	KindText    Kind = "text"
+	KindPDF     Kind = "pdf"     // the document itself — expanded into pages by ExpandPDF
+	KindPDFPage Kind = "pdfpage" // one page of it, with the synthesized annotation
 )
 
 // Extension sets used as format hints.
@@ -37,6 +41,7 @@ var (
 	PageExts  = map[string]bool{".html": true, ".htm": true, ".xhtml": true}
 	TreeExts  = map[string]bool{".json": true}
 	TextExts  = map[string]bool{".txt": true, ".text": true, ".md": true, ".markdown": true}
+	PDFExts   = map[string]bool{".pdf": true}
 )
 
 // ErrUnsupportedInput reports input bytes in a format this tool does not
@@ -48,8 +53,17 @@ type Input struct {
 	Name   string // display name / original path
 	Data   []byte
 	Hint   string // filename hint for sniffing
-	Kind   Kind   // image | page | tree | text
+	Kind   Kind   // image | page | tree | text | pdf | pdfpage
 	Format string // upper-cased format name for reports
+
+	// pdfpage fields (set by ExpandPDF): the page's text layer as a
+	// synthesized OCR annotation plus the page geometry it was built
+	// from. Boxes are page points with a top-left origin.
+	Ann       *pb.Annotation
+	Page      int // 1-based page number
+	PageCount int // pages in the source document
+	Width     int // page width in points
+	Height    int // page height in points
 }
 
 var htmlTagRe = regexp.MustCompile(`(?i)</?[a-z][a-z0-9-]*(\s|>|/)`)
@@ -153,7 +167,14 @@ func Classify(data []byte, hint, contentType, source string) (*Input, error) {
 	ext := strings.ToLower(path.Ext(hint))
 
 	if format := imaging.Sniff(data, hint); format != "" {
-		return &Input{source, data, hint, KindImage, strings.ToUpper(format)}, nil
+		return &Input{Name: source, Data: data, Hint: hint, Kind: KindImage, Format: strings.ToUpper(format)}, nil
+	}
+
+	if PDFExts[ext] || bytes.HasPrefix(data, []byte("%PDF-")) {
+		if !bytes.HasPrefix(data, []byte("%PDF-")) {
+			return nil, fmt.Errorf("%w: %s: extension suggests a PDF but the %%PDF- header is missing", ErrUnsupportedInput, hint)
+		}
+		return &Input{Name: source, Data: data, Hint: hint, Kind: KindPDF, Format: "PDF"}, nil
 	}
 
 	text := ""
@@ -168,7 +189,7 @@ func Classify(data []byte, hint, contentType, source string) (*Input, error) {
 		if text == "" {
 			return nil, fmt.Errorf("%w: %s: not valid UTF-8 HTML", ErrUnsupportedInput, hint)
 		}
-		return &Input{source, data, hint, KindPage, "HTML"}, nil
+		return &Input{Name: source, Data: data, Hint: hint, Kind: KindPage, Format: "HTML"}, nil
 	}
 	if TreeExts[ext] || (text != "" && looksLikeJSON(text)) || strings.Contains(strings.ToLower(contentType), "json") {
 		if text == "" {
@@ -177,10 +198,10 @@ func Classify(data []byte, hint, contentType, source string) (*Input, error) {
 		if !json.Valid(data) {
 			return nil, fmt.Errorf("%w: %s: invalid JSON", ErrUnsupportedInput, hint)
 		}
-		return &Input{source, data, hint, KindTree, "JSON"}, nil
+		return &Input{Name: source, Data: data, Hint: hint, Kind: KindTree, Format: "JSON"}, nil
 	}
 	if text != "" && looksLikeText(text) {
-		return &Input{source, data, hint, KindText, "text"}, nil
+		return &Input{Name: source, Data: data, Hint: hint, Kind: KindText, Format: "text"}, nil
 	}
 	return nil, fmt.Errorf("%w: %s: unrecognized format (images: PNG/JPEG/GIF/BMP/TGA/PPM; pages: HTML; trees: JSON; text: TXT)", ErrUnsupportedInput, hint)
 }

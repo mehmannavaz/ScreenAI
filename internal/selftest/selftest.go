@@ -62,6 +62,7 @@ func Run(componentDir string) []Result {
 	check("tree-fromtext", testTreeFromText)
 	check("tree-html-inline", testHTMLInline)
 	check("classify-sniffing", testClassify)
+	check("pdf-text-layer", testPDFTextLayer)
 	check("settings-template", testSettingsTemplate)
 	check("settings-json-nested", testSettingsJSONNested)
 	check("reader-render", testReaderRender)

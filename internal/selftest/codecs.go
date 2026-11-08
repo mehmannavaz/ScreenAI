@@ -7,8 +7,12 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 
 	"github.com/mehmannavaz/ScreenAI/internal/imaging"
+	"github.com/mehmannavaz/ScreenAI/internal/pagetree"
+	"github.com/mehmannavaz/ScreenAI/internal/pdftext"
+	"github.com/mehmannavaz/ScreenAI/internal/pipeline"
 )
 
 // testTGAUncompressed decodes a 2x2 uncompressed 24-bit bottom-up TGA.
@@ -213,6 +217,46 @@ func testDownscale() error {
 	// no-op when it already fits
 	if same := imaging.ResizeMax(img, 4); same != img {
 		return errNoop()
+	}
+	return nil
+}
+
+// testPDFTextLayer verifies the whole PDF chain without the component:
+// a generated two-page PDF classifies as a PDF document, expands into
+// per-page inputs with exact text-layer geometry, and the semantic tree
+// the Screen2x model would eat carries a heading role — the 24pt title
+// over 11pt body is unambiguous at the default heading ratio.
+func testPDFTextLayer() error {
+	data := pdftext.SimpleFixture()
+	inp, err := pipeline.Classify(data, "fixture.pdf", "", "fixture.pdf")
+	if err != nil {
+		return err
+	}
+	if inp.Kind != pipeline.KindPDF {
+		return fmt.Errorf("classified as %s, want pdf", inp.Kind)
+	}
+	exp, err := pipeline.ExpandPDF(inp)
+	if err != nil {
+		return err
+	}
+	if exp.Total != 2 || len(exp.Pages) != 2 || len(exp.NoText) != 0 {
+		return fmt.Errorf("expansion: total=%d pages=%d noText=%d, want 2/2/0", exp.Total, len(exp.Pages), len(exp.NoText))
+	}
+	p1 := exp.Pages[0]
+	if p1.Kind != pipeline.KindPDFPage || p1.Ann == nil || len(p1.Ann.Lines) != 7 {
+		return fmt.Errorf("page 1: kind=%s lines=%d, want pdfpage with 7 lines", p1.Kind, len(p1.Ann.Lines))
+	}
+	// The exact chain Process runs for a pdfpage: tree from the
+	// synthesized annotation (no pixels, no OCR model).
+	tree := pagetree.FromOCR(p1.Ann, nil, p1.Width, p1.Height, pagetree.DefaultTreeOptions())
+	found := false
+	for _, n := range tree.Nodes {
+		if n.Node.Role == "heading" && strings.Contains(pagetree.SubtreeText(n.Node), "Fixture Heading") {
+			found = true
+		}
+	}
+	if !found {
+		return errors.New("no heading node in the page-1 tree (24pt over 11pt body)")
 	}
 	return nil
 }
